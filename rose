@@ -1,0 +1,1556 @@
+#!/usr/bin/env python3
+"""rose — one launcher for several Claude Code and Codex CLI accounts.
+
+Design follows codexx (https://github.com/JoRo-Code/codexx, MIT):
+  * every account has its own home (CLAUDE_CONFIG_DIR / CODEX_HOME), so logins,
+    history and sessions never mix;
+  * non-secret config (settings, CLAUDE.md/AGENTS.md, skills, plugins,
+    config.toml ...) is symlinked from ~/.claude and ~/.codex and edited once;
+  * chats can be moved to another account and resumed there, manually
+    (`rose move`, `rose resume --to`) or when an account hits its usage limit
+    (failover mode: off / ask / auto).
+
+Python 3.9+, macOS/Linux, no dependencies.
+"""
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+VERSION = '0.1.0'
+ROOT = Path(os.environ.get('ROSE_HOME') or
+            Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'rose').expanduser()
+TOOLS = ('claude', 'codex')
+LABEL = {'claude': 'Claude', 'codex': 'Codex'}
+HOME_VAR = {'claude': 'CLAUDE_CONFIG_DIR', 'codex': 'CODEX_HOME'}
+BINARY = {'claude': os.environ.get('ROSE_CLAUDE_BIN', 'claude'),
+          'codex': os.environ.get('ROSE_CODEX_BIN', 'codex')}
+SHARED_SRC = {'claude': Path(os.environ.get('ROSE_CLAUDE_SHARED') or Path.home() / '.claude').expanduser(),
+              'codex': Path(os.environ.get('ROSE_CODEX_SHARED') or Path.home() / '.codex').expanduser()}
+# Safe and useful to share. Never credentials, history, sessions, projects or caches.
+SHARED_ITEMS = {
+    'claude': ['settings.json', 'CLAUDE.md', 'keybindings.json', 'skills', 'agents', 'commands',
+               'hooks', 'output-styles', 'plugins', 'statusline.sh'],
+    'codex': ['config.toml', 'AGENTS.md', 'hooks.json', 'skills', 'prompts', 'rules'],
+}
+# Ambient credentials that would silently override the selected account's login.
+AUTH_ENV = {
+    'claude': ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+               'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY'],
+    'codex': ['OPENAI_API_KEY', 'CODEX_API_KEY', 'CODEX_ACCESS_TOKEN'],
+}
+# Native subcommands: run directly under the chosen account, no session tracking.
+PASSTHROUGH = {
+    'claude': {'agents', 'attach', 'auth', 'auto-mode', 'doctor', 'gateway', 'import', 'install', 'logs',
+               'mcp', 'plugin', 'plugins', 'purge', 'respawn', 'rm', 'sessions', 'setup-token', 'stop',
+               'kill', 'ultrareview', 'update', 'upgrade', 'help'},
+    'codex': {'exec', 'e', 'review', 'login', 'logout', 'mcp', 'mcp-server', 'plugin', 'completion',
+              'update', 'doctor', 'sandbox', 'debug', 'apply', 'a', 'queue', 'archive', 'delete',
+              'unarchive', 'fork', 'cloud', 'features', 'help', 'agents', 'app-server'},
+}
+NONINTERACTIVE_FLAGS = {'claude': {'-p', '--print', '-h', '--help', '-v', '--version'},
+                        'codex': {'-h', '--help', '-V', '--version'}}
+NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$')
+MODES = ('off', 'ask', 'auto')
+CONTINUE_PROMPT = ('[rose] The previous account hit its usage limit, so this conversation was moved to '
+                   'another account. Continue the task from where it stopped. Check what was already '
+                   'done before repeating anything that has side effects.')
+DEFAULT_COOLDOWN = 300
+
+
+class Error(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- storage
+
+def private_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.chmod(0o700)
+    return path
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def atomic_json(path, data):
+    private_dir(path.parent)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.tmp-')
+    with os.fdopen(fd, 'w') as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def lock(name):
+    private_dir(ROOT / 'locks')
+    with open(ROOT / 'locks' / (name + '.lock'), 'a') as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def settings():
+    s = read_json(ROOT / 'settings.json', {})
+    s.setdefault('failover', {'claude': 'ask', 'codex': 'ask'})
+    s.setdefault('defaults', {})
+    return s
+
+
+def save_settings(s):
+    with lock('settings'):
+        atomic_json(ROOT / 'settings.json', s)
+
+
+def record(event, **fields):
+    fields.update(event=event, time=dt.datetime.now().astimezone().isoformat(timespec='seconds'))
+    private_dir(ROOT)
+    with open(ROOT / 'activity.jsonl', 'a') as f:
+        f.write(json.dumps(fields) + '\n')
+
+
+def owners():
+    return read_json(ROOT / 'owners.json', {})
+
+
+def set_owner(tool, sid, name):
+    with lock('owners'):
+        o = owners()
+        o[tool + ':' + sid] = name
+        atomic_json(ROOT / 'owners.json', o)
+
+
+CHAT_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,59}$')
+
+
+def chat_names():
+    """{'claude:<session id>': 'excel-calcs'}"""
+    return read_json(ROOT / 'names.json', {})
+
+
+def set_chat_name(tool, sid, name, force=False):
+    if name and not CHAT_NAME.match(name):
+        raise Error('chat names: letters, digits, . - _ (no spaces), e.g. excel-calcs')
+    with lock('names'):
+        names = chat_names()
+        key = tool + ':' + sid
+        if name:
+            taken = [k for k, v in names.items() if v.lower() == name.lower() and k != key]
+            if taken and not force:
+                raise Error(f"'{name}' is already used by another chat (rose name ... --force to take it)")
+            for k in taken:
+                del names[k]
+            names[key] = name
+        else:
+            names.pop(key, None)
+        atomic_json(ROOT / 'names.json', names)
+
+
+def ref(row):
+    """How to refer to a chat on the command line."""
+    return row.get('name') or row['id'][:8]
+
+
+# ---- live Claude usage (recorded from the status line input, a documented Claude Code hook)
+
+WINDOWS = (('five_hour', '5h'), ('seven_day', 'week'))
+
+
+def usage_path(name):
+    return ROOT / 'usage' / f'claude-{name}.json'
+
+
+def claude_usage(name):
+    """Last recorded plan usage: {'seen': ts, 'five_hour': {'used': 42, 'resets_at': ts}, ...} or {}."""
+    return read_json(usage_path(name), {})
+
+
+def window_used(info, now=None):
+    """Percent used, or None if unknown / the window has reset since it was seen."""
+    if not info or info.get('used') is None:
+        return None
+    if info.get('resets_at') and (now or time.time()) >= float(info['resets_at']):
+        return None
+    return float(info['used'])
+
+
+def usage_text(name):
+    u = claude_usage(name)
+    if not u:
+        return 'usage: unknown until a chat runs on it'
+    parts = []
+    for key, label in WINDOWS:
+        w = u.get(key)
+        if not w:
+            continue
+        used = window_used(w)
+        reset = clock(float(w['resets_at'])) if w.get('resets_at') else '?'
+        parts.append(f'{label} reset (was {w["used"]:.0f}%)' if used is None else f'{label} {used:.0f}% (resets {reset})')
+    return ' · '.join(parts + [f"seen {ago(u.get('seen', 0))}"]) if parts else 'usage: not reported (API-key login?)'
+
+
+def exhausted(name):
+    u = claude_usage(name)
+    return any((window_used(u.get(k)) or 0) >= 100 for k, _ in WINDOWS)
+
+
+def statusline_account():
+    """Which rose Claude account the calling Claude process runs as."""
+    named = os.environ.get('ROSE_CLAUDE')
+    if named and ('claude', named) in accounts('claude'):
+        return named
+    home = Path(os.environ.get('CLAUDE_CONFIG_DIR') or native_home('claude')).resolve()
+    for t, n in accounts('claude'):
+        if account_home(t, n) == home:
+            return n
+    return None
+
+
+def cmd_statusline(_argv):
+    """Called by Claude Code as its status line: record usage, then run the original status line."""
+    raw = sys.stdin.read()
+    with contextlib.suppress(Exception):  # never break the status line
+        data = json.loads(raw or '{}')
+        limits = data.get('rate_limits') or {}
+        name = statusline_account()
+        if name and limits:
+            rec = {'seen': time.time(), 'session': data.get('session_id')}
+            for key, _ in WINDOWS:
+                w = limits.get(key) or {}
+                if w.get('used_percentage') is not None:
+                    rec[key] = {'used': float(w['used_percentage']), 'resets_at': w.get('resets_at')}
+            old = claude_usage(name)
+            changed = any(old.get(k) != rec.get(k) for k, _ in WINDOWS)
+            if changed or time.time() - old.get('seen', 0) > 60:
+                atomic_json(usage_path(name), rec)
+    original = (settings().get('statusline_original') or {}).get('command')
+    if original:
+        r = subprocess.run(original, shell=True, input=raw, capture_output=True, text=True)
+        sys.stdout.write(r.stdout)
+    return 0
+
+
+def statusline_command():
+    return shlex.quote(str(Path(__file__).resolve())) + ' statusline'
+
+
+def cmd_usage(a):
+    s = settings()
+    f = SHARED_SRC['claude'] / 'settings.json'
+    if a.action in ('install', 'uninstall'):
+        data = read_json(f, None)
+        if data is None:
+            raise Error(f'cannot read {f}')
+        current = data.get('statusLine')
+        installed = bool(current and 'statusline' in str(current.get('command', '')) and
+                         str(Path(__file__).resolve()) in str(current.get('command', '')))
+        shutil.copy2(f, f.with_name(f.name + '.bak-rose-usage'))
+        if a.action == 'install':
+            if not installed:
+                s['statusline_original'] = current or {}
+                save_settings(s)
+                data['statusLine'] = dict(current or {}, type='command', command=statusline_command())
+            print('Usage recording is on. Your status line still shows the same thing.')
+        else:
+            orig = s.pop('statusline_original', None)
+            if installed:
+                if orig and orig.get('command'):
+                    data['statusLine'] = orig
+                else:
+                    data.pop('statusLine', None)
+            save_settings(s)
+            print('Usage recording is off; original status line restored.')
+        text = json.dumps(data, indent=2, ensure_ascii=False) + '\n'
+        if f.is_symlink():
+            f = f.resolve()
+        fd, tmp = tempfile.mkstemp(dir=f.parent, prefix='.rose-')
+        with os.fdopen(fd, 'w') as out:
+            out.write(text)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, f)
+        for t, n in accounts('claude'):
+            h = account_home(t, n) / 'settings.json'
+            if h.exists() and not h.is_symlink() and h.resolve() != f.resolve():
+                print(f'  note: {t}:{n} has its own settings.json, so it does not record usage')
+        return 0
+    for t, n in accounts('claude'):
+        print(f'  {n:<14} {usage_text(n)}')
+    on = 'statusline' in str((read_json(f, {}).get('statusLine') or {}).get('command', ''))
+    if not on:
+        print('\nRecording is off: rose usage install')
+    return 0
+
+
+def cooldowns():
+    data = read_json(ROOT / 'cooldowns.json', {})
+    now = time.time()
+    return {k: v for k, v in data.items() if v.get('until', 0) > now}
+
+
+def set_cooldown(tool, name, until, reason):
+    with lock('cooldowns'):
+        c = cooldowns()
+        c[tool + ':' + name] = {'until': until, 'reason': reason}
+        atomic_json(ROOT / 'cooldowns.json', c)
+
+
+def clock(ts):
+    t = dt.datetime.fromtimestamp(ts)
+    fmt = '%H:%M' if t.date() == dt.date.today() else '%a %d %b %H:%M'
+    return t.strftime(fmt)
+
+
+def ago(ts):
+    s = max(0, time.time() - ts)
+    for unit, n in (('d', 86400), ('h', 3600), ('m', 60)):
+        if s >= n:
+            return '%d%s ago' % (s // n, unit)
+    return 'now'
+
+
+# ---------------------------------------------------------------- accounts
+
+def account_dir(tool, name):
+    return ROOT / 'accounts' / tool / name
+
+
+def native_home(tool):
+    return (Path.home() / ('.claude' if tool == 'claude' else '.codex')).resolve()
+
+
+def home_value(tool, name):
+    """Value for CLAUDE_CONFIG_DIR / CODEX_HOME, or None to leave it unset.
+
+    An account adopting the native home must not set the variable: Claude Code
+    keeps its state in ~/.claude.json only when CLAUDE_CONFIG_DIR is unset."""
+    home = account_home(tool, name)
+    return None if home == native_home(tool) else str(home)
+
+
+def account_home(tool, name):
+    """The directory the tool uses. Adopted accounts are symlinks to an existing home."""
+    return account_dir(tool, name).resolve()
+
+
+def accounts(tool=None):
+    out = []
+    for t in ([tool] if tool else TOOLS):
+        base = ROOT / 'accounts' / t
+        if base.is_dir():
+            out += [(t, p.name) for p in sorted(base.iterdir()) if p.is_dir() and NAME.match(p.name)]
+    return out
+
+
+def parse_spec(spec, tool=None):
+    """'work', 'claude:work' or 'claude/work' -> (tool, name)."""
+    m = re.match(r'^(claude|codex)[:/](.+)$', spec)
+    if m:
+        tool, spec = m.group(1), m.group(2)
+    matches = [a for a in accounts(tool) if a[1] == spec]
+    if not matches:
+        where = LABEL[tool] + ' ' if tool else ''
+        raise Error(f"no {where}account '{spec}'. Accounts: " +
+                    (', '.join(f'{t}:{n}' for t, n in accounts(tool)) or 'none (rose add claude work)'))
+    if len(matches) > 1:
+        raise Error(f"'{spec}' exists for both tools; say claude:{spec} or codex:{spec}")
+    return matches[0]
+
+
+def env_file(tool, name):
+    return ROOT / 'env' / f'{tool}-{name}.env'
+
+
+def load_env_file(path):
+    out = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        line = re.sub(r'^export\s+', '', line)
+        if '=' in line:
+            k, v = line.split('=', 1)
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+                v = v[1:-1]
+            out[k.strip()] = v
+    return out
+
+
+def environment(tool, name, base=None):
+    env = dict(os.environ if base is None else base)
+    for var in AUTH_ENV[tool]:
+        env.pop(var, None)
+    value = home_value(tool, name)
+    if value:
+        env[HOME_VAR[tool]] = value
+    else:
+        env.pop(HOME_VAR[tool], None)
+    env['ROSE_' + tool.upper()] = name
+    env.update(load_env_file(env_file(tool, name)))
+    return env
+
+
+def claude_state_file(home):
+    """Claude keeps .claude.json inside CLAUDE_CONFIG_DIR, except for the default home (~/.claude.json)."""
+    return Path.home() / '.claude.json' if home == native_home('claude') else home / '.claude.json'
+
+
+def has_login(tool, name):
+    """Cheap, offline check used for routing."""
+    home = account_home(tool, name)
+    if tool == 'codex':
+        return (home / 'auth.json').is_file()
+    if (home / '.credentials.json').is_file():
+        return True
+    data = read_json(claude_state_file(home), {})
+    return bool(data.get('oauthAccount')) or bool(load_env_file(env_file(tool, name)))
+
+
+def identity(tool, name):
+    """(auth description, email) from the tool itself."""
+    env = environment(tool, name)
+    home = account_home(tool, name)
+    try:
+        if tool == 'claude':
+            r = subprocess.run([BINARY['claude'], 'auth', 'status', '--json'], env=env,
+                               capture_output=True, text=True, timeout=20)
+            info = json.loads(r.stdout or '{}')
+            auth = info.get('authMethod') if info.get('loggedIn') else 'not logged in'
+            if info.get('apiKeySource'):
+                auth += ' (' + info['apiKeySource'] + ')'
+            acct = read_json(claude_state_file(home), {}).get('oauthAccount') or {}
+            return auth, acct.get('emailAddress', '')
+        r = subprocess.run([BINARY['codex'], 'login', 'status'], env=env, capture_output=True,
+                           text=True, timeout=20)
+        lines = [ln for ln in (r.stdout + r.stderr).splitlines() if ln.strip() and 'WARNING' not in ln]
+        return (lines[-1].strip() if lines else ('logged in' if r.returncode == 0 else 'not logged in')), ''
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        return 'unknown (%s)' % e.__class__.__name__, ''
+
+
+def link_shared(tool, name, quiet=False):
+    src, home = SHARED_SRC[tool], account_home(tool, name)
+    if src.resolve() == home:
+        return  # adopted default home: it is the shared source
+    for item in SHARED_ITEMS[tool]:
+        s, t = src / item, home / item
+        if not s.exists() or t.is_symlink():
+            continue
+        if t.exists():
+            if not quiet:
+                print(f'  keep  {t} (account-specific copy; delete it to share)')
+            continue
+        t.symlink_to(s)
+        if not quiet:
+            print(f'  link  {t} -> {s}')
+
+
+def shared_warnings():
+    out = []
+    f = SHARED_SRC['claude'] / 'settings.json'
+    data = read_json(f, {})
+    for var in AUTH_ENV['claude']:
+        if var in (data.get('env') or {}):
+            out.append(f'{f} sets {var} in "env": it applies to EVERY Claude account and overrides '
+                       f'their logins. Move it to the env file of the account that should use it '
+                       f'(rose env claude <name>).')
+    if data.get('apiKeyHelper'):
+        out.append(f'{f} has apiKeyHelper; it applies to every Claude account.')
+    return out
+
+
+# ---------------------------------------------------------------- sessions
+
+def jsonl_head(path, limit=262144):
+    with open(path, errors='replace') as f:
+        for line in f.read(limit).splitlines():
+            with contextlib.suppress(ValueError):
+                yield json.loads(line)
+
+
+def jsonl_tail(path, limit=262144):
+    with open(path, 'rb') as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - limit))
+        data = f.read().decode('utf-8', 'replace').splitlines()
+    if size > limit:
+        data = data[1:]
+    out = []
+    for line in data:
+        with contextlib.suppress(ValueError):
+            out.append(json.loads(line))
+    return out
+
+
+def clean(text, n=70):
+    text = ' '.join(str(text).split())
+    return text if len(text) <= n else text[:n - 1] + '…'
+
+
+def user_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return ' '.join(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
+    return ''
+
+
+def claude_session(path, name):
+    cwd, first = '', ''
+    for item in jsonl_head(path):
+        cwd = cwd or item.get('cwd', '')
+        if not first and item.get('type') == 'user' and not item.get('isMeta'):
+            t = user_text((item.get('message') or {}).get('content'))
+            if t.strip() and not t.lstrip().startswith('<'):
+                first = t
+        if cwd and first:
+            break
+    title = ''
+    for item in reversed(jsonl_tail(path, 131072)):
+        title = item.get('customTitle') or item.get('aiTitle') or ''
+        if title:
+            break
+    return dict(tool='claude', account=name, id=path.stem, cwd=cwd, title=clean(title or first or '(untitled)'),
+                modified=path.stat().st_mtime, path=str(path))
+
+
+def codex_session(path, name):
+    head = list(jsonl_head(path))
+    if not head or head[0].get('type') != 'session_meta':
+        return None
+    meta = head[0].get('payload') or {}
+    title = ''
+    for item in head:
+        p = item.get('payload') or {}
+        if item.get('type') == 'event_msg' and p.get('type') == 'user_message':
+            t = p.get('message', '')
+            if isinstance(t, str) and t.strip() and not t.lstrip().startswith('<'):
+                title = t
+                break
+    return dict(tool='codex', account=name, id=str(meta.get('id', '')), cwd=meta.get('cwd', ''),
+                title=clean(title or '(untitled)'), modified=path.stat().st_mtime, path=str(path),
+                history_mode=meta.get('history_mode', 'legacy'))
+
+
+def session_files(tool, name):
+    home = account_home(tool, name)
+    if tool == 'claude':
+        return sorted((home / 'projects').glob('*/*.jsonl')) if (home / 'projects').is_dir() else []
+    return sorted((home / 'sessions').rglob('rollout-*.jsonl')) if (home / 'sessions').is_dir() else []
+
+
+def sessions(tool=None, account=None):
+    own = owners()
+    rows = {}
+    for t, n in accounts(tool):
+        if account and n != account:
+            continue
+        for p in session_files(t, n):
+            try:
+                row = claude_session(p, n) if t == 'claude' else codex_session(p, n)
+            except OSError:
+                continue
+            if not row or not row['id']:
+                continue
+            key = t + ':' + row['id']
+            owner = own.get(key)
+            if owner and owner != n:
+                continue  # stale copy left behind by a move
+            if key not in rows or rows[key]['modified'] < row['modified']:
+                rows[key] = row
+    running = {(r['tool'], r.get('sid')) for r in running_records()}
+    names = chat_names()
+    for key, r in rows.items():
+        r['open'] = (r['tool'], r['id']) in running
+        r['name'] = names.get(key)
+    return sorted(rows.values(), key=lambda r: r['modified'], reverse=True)
+
+
+def find_session(prefix, tool=None):
+    """A chat by rose name, then by the tool's own title (/rename), then by id prefix."""
+    everything = sessions(tool)
+    low = prefix.lower()
+    for match in ([r for r in everything if (r.get('name') or '').lower() == low],
+                  [r for r in everything if r['title'].lower() == low]):
+        if len(match) == 1:
+            return match[0]
+    rows = [r for r in everything if r['id'].startswith(prefix)]
+    if not rows:
+        raise Error(f"no chat named or with id '{prefix}' (rose sessions)")
+    if len({(r['tool'], r['id']) for r in rows}) > 1:
+        raise Error(f"'{prefix}' matches several chats; use more characters")
+    return rows[0]
+
+
+# ---------------------------------------------------------------- running registry
+
+def running_records():
+    d = ROOT / 'running'
+    out = []
+    if not d.is_dir():
+        return out
+    for f in d.glob('*.json'):
+        r = read_json(f, None)
+        try:
+            os.kill(int(r['pid']), 0)
+            out.append(r)
+        except (TypeError, KeyError, ValueError, ProcessLookupError, PermissionError):
+            with contextlib.suppress(OSError):
+                f.unlink()
+    return out
+
+
+def register(pid, **fields):
+    fields['pid'] = pid
+    atomic_json(ROOT / 'running' / f'{pid}.json', fields)
+
+
+def unregister(pid):
+    with contextlib.suppress(OSError):
+        (ROOT / 'running' / f'{pid}.json').unlink()
+
+
+# ---------------------------------------------------------------- moving chats
+
+def backup(path):
+    dest = private_dir(ROOT / 'backups' / time.strftime('%Y%m%d-%H%M%S')) / (uuid.uuid4().hex[:8] + '-' + path.name)
+    (shutil.copytree if path.is_dir() else shutil.copy2)(path, dest)
+    return dest
+
+
+def stable_copy(src, dst):
+    private_dir(dst.parent)
+    fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix='.rose-')
+    os.close(fd)
+    try:
+        before = src.stat()
+        shutil.copyfile(src, tmp)
+        after = src.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise Error('the chat changed while copying; close it and retry')
+        os.replace(tmp, dst)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+
+
+@contextlib.contextmanager
+def codex_writer_lock(home, sid):
+    d = private_dir(home / 'thread-writer-locks')
+    with open(d / (sid + '.lock'), 'a') as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Error('Codex is using this conversation; close it first')
+        yield
+
+
+def codex_reset_projection(home, sid):
+    """Paginated history: derived per-thread tables are rebuilt by Codex on resume (as in codexx)."""
+    dbs = list(home.glob('thread_history_*.sqlite'))
+    if not dbs:
+        return
+    if len(dbs) != 1 or dbs[0].name != 'thread_history_1.sqlite':
+        raise Error('unsupported Codex history database version; nothing was moved')
+    db = sqlite3.connect(dbs[0], timeout=5)
+    try:
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for t in sorted(tables & {'thread_turns', 'thread_items', 'thread_history_projection_state',
+                                  'thread_realtime_items'}):
+            if 'thread_id' in {r[1] for r in db.execute(f'PRAGMA table_info("{t}")')}:
+                db.execute(f'DELETE FROM "{t}" WHERE thread_id = ?', (sid,))
+        db.commit()
+    finally:
+        db.close()
+
+
+def codex_ancestors(path, home, seen=None):
+    """Rollouts this paginated history depends on (history_base chain)."""
+    seen = seen or set()
+    meta = (next(jsonl_head(path, 1048576), {}) or {}).get('payload') or {}
+    base = (meta.get('history_base') or {}).get('thread_id')
+    if not base or base in seen:
+        return []
+    seen.add(base)
+    found = list((home / 'sessions').rglob(f'*{base}.jsonl'))
+    if len(found) != 1:
+        raise Error(f'missing or ambiguous parent history {base}; nothing was moved')
+    return [found[0]] + codex_ancestors(found[0], home, seen)
+
+
+def move(row, target, quiet=False, event='moved'):
+    tool, source = row['tool'], row['account']
+    if target == source:
+        raise Error('the chat already belongs to that account')
+    if (tool, target) not in accounts(tool):
+        raise Error(f"no {LABEL[tool]} account '{target}'")
+    if any(r['tool'] == tool and r.get('sid') == row['id'] for r in running_records()):
+        raise Error('this chat is open in a rose session; exit it first')
+    src_home, dst_home = account_home(tool, source), account_home(tool, target)
+    src = Path(row['path'])
+    with lock(f'move-{tool}-{row["id"]}'):
+        if tool == 'claude':
+            rel = src.relative_to(src_home / 'projects')
+            dst = dst_home / 'projects' / rel
+            if dst.exists():
+                backup(dst)
+            stable_copy(src, dst)
+            extras = [(src.with_suffix(''), dst.with_suffix('')),                     # subagents, tool results
+                      (src_home / 'file-history' / row['id'], dst_home / 'file-history' / row['id'])]
+            for a, b in extras:
+                if a.is_dir():
+                    shutil.copytree(a, b, dirs_exist_ok=True)
+        else:
+            with codex_writer_lock(src_home, row['id']), codex_writer_lock(dst_home, row['id']):
+                for anc in codex_ancestors(src, src_home):
+                    dest = dst_home / anc.relative_to(src_home)
+                    if not dest.exists():
+                        stable_copy(anc, dest)
+                existing = list((dst_home / 'sessions').rglob(f'*{row["id"]}.jsonl'))
+                dst = existing[0] if existing else dst_home / src.relative_to(src_home)
+                if dst.exists():
+                    backup(dst)
+                stable_copy(src, dst)
+                codex_reset_projection(dst_home, row['id'])
+        set_owner(tool, row['id'], target)
+        record(event, tool=tool, session=row['id'], account=target, previous=source,
+               cwd=row.get('cwd'), title=row.get('title'))
+    if not quiet:
+        print(f"Moved {LABEL[tool]} chat {row['id'][:8]} from {source} to {target} (original kept).")
+
+
+# ---------------------------------------------------------------- usage-limit detection
+
+def iso_ts(value):
+    try:
+        return dt.datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except ValueError:
+        return 0
+
+
+def claude_limit(path, since):
+    """Last conversational entry is a usage-limit error newer than `since` -> info dict."""
+    for item in reversed(jsonl_tail(path)):
+        if item.get('type') not in ('user', 'assistant') or item.get('isMeta') or item.get('isSidechain'):
+            continue
+        if item.get('type') == 'user':
+            return None
+        limited = item.get('apiError') == 'usage_limit_reached' or (
+            item.get('error') == 'rate_limit' and (item.get('quotaLimits') or {}).get('status') == 'rejected')
+        if not (item.get('isApiErrorMessage') and limited):
+            return None
+        if iso_ts(item.get('timestamp')) < since:
+            return None
+        info = ((item.get('apiErrorParams') or {}).get('rate_limit_info') or item.get('quotaLimits') or {})
+        return dict(reset=info.get('resetsAt'), kind=info.get('rateLimitType', 'usage limit'),
+                    text=user_text((item.get('message') or {}).get('content')))
+    return None
+
+
+def codex_limit(path, since):
+    for item in reversed(jsonl_tail(path)):
+        if item.get('type') != 'event_msg':
+            continue
+        p = item.get('payload') or {}
+        kind = p.get('type')
+        if kind in ('user_message', 'agent_message'):
+            return None
+        if kind not in ('error', 'stream_error'):
+            continue
+        info = json.dumps(p.get('codex_error_info', ''))
+        msg = str(p.get('message', ''))
+        if not (re.search(r'usage_?limit', info, re.I) or re.search(r'usage limit|hit your .*limit', msg, re.I)):
+            return None
+        if iso_ts(item.get('timestamp')) < since:
+            return None
+        return dict(reset=None, kind='usage limit', text=msg)
+    return None
+
+
+def current_transcript(tool, name, cwd, since, sid=None):
+    """The chat a launched process is writing: the newest transcript touched since launch."""
+    home = account_home(tool, name)
+    files = session_files(tool, name)
+    fresh = [p for p in files if p.stat().st_mtime >= since - 1]
+    if tool == 'claude':
+        enc = re.sub(r'[^A-Za-z0-9]', '-', str(cwd))
+        local = [p for p in fresh if p.parent.name == enc]
+        fresh = local or fresh
+    elif fresh:
+        fresh = [p for p in fresh if (codex_session(p, name) or {}).get('cwd') == str(cwd)] or fresh
+    if fresh:
+        return max(fresh, key=lambda p: p.stat().st_mtime)
+    if sid:
+        hits = list(home.glob(f'projects/*/{sid}.jsonl')) if tool == 'claude' else \
+            list((home / 'sessions').rglob(f'*{sid}.jsonl'))
+        return hits[0] if hits else None
+    return None
+
+
+# ---------------------------------------------------------------- launching
+
+def defaults_args(tool, args):
+    d = settings()['defaults'].get(tool, {})
+    out = []
+    if tool == 'claude':
+        if d.get('model') and '--model' not in args:
+            out += ['--model', d['model']]
+        if d.get('effort') and '--effort' not in args:
+            out += ['--effort', d['effort']]
+        if d.get('yolo') and '--dangerously-skip-permissions' not in args:
+            out += ['--dangerously-skip-permissions']
+    else:
+        if d.get('model') and not {'-m', '--model'} & set(args):
+            out += ['-m', d['model']]
+        if d.get('effort'):
+            out += ['-c', f'model_reasoning_effort="{d["effort"]}"']
+        if d.get('yolo') and '--dangerously-bypass-approvals-and-sandbox' not in args:
+            out += ['--dangerously-bypass-approvals-and-sandbox']
+    return out
+
+
+def build_cmd(tool, args, resume=None, new_sid=None, prompt=None):
+    b = BINARY[tool]
+    extra = defaults_args(tool, args)
+    tail = [prompt] if prompt else []
+    if tool == 'claude':
+        if resume:
+            return [b, '--resume', resume] + extra + args + tail
+        return [b] + (['--session-id', new_sid] if new_sid else []) + extra + args + tail
+    if resume:
+        return [b, 'resume'] + extra + args + [resume] + tail
+    return [b] + extra + args + tail
+
+
+def restore_terminal():
+    if sys.stdout.isatty():
+        sys.stdout.write('\x1b[?1049l\x1b[?25h\x1b[0m\x1b[<u\n')
+        sys.stdout.flush()
+        subprocess.run(['stty', 'sane'], stdin=sys.stdin, check=False)
+
+
+def failover_mode(tool, override=None):
+    mode = override or settings()['failover'].get(tool, 'ask')
+    return mode if mode in MODES else 'ask'
+
+
+def candidates(tool, exclude):
+    cool = cooldowns()
+    order = settings().get('order', {}).get(tool, [])
+    names = [n for t, n in accounts(tool) if n not in exclude and has_login(t, n) and f'{t}:{n}' not in cool
+             and not (tool == 'claude' and exhausted(n))]
+
+    def rank(n):
+        u = claude_usage(n) if tool == 'claude' else {}
+        known = [x for x in (window_used(u.get(k)) for k, _ in WINDOWS) if x is not None]
+        return (order.index(n) if n in order else len(order), max(known) if known else 50)
+    return sorted(names, key=rank)
+
+
+def ask(question, default=False):
+    if not sys.stdin.isatty():
+        return default
+    try:
+        a = input(question + (' [Y/n] ' if default else ' [y/N] ')).strip().lower()
+    except EOFError:
+        return default
+    return default if not a else a in ('y', 'yes')
+
+
+def pick(title, options, allow_none=True):
+    """Numbered picker. options: list of (value, label). Returns value or None."""
+    if not options:
+        return None
+    if not sys.stdin.isatty():
+        raise Error(title + ': not a terminal, pass it explicitly')
+    print(title)
+    for i, (_, label) in enumerate(options, 1):
+        print(f'  {i:>2}) {label}')
+    while True:
+        try:
+            a = input('  choose' + (' (enter = cancel)' if allow_none else '') + ': ').strip()
+        except EOFError:
+            return None
+        if not a and allow_none:
+            return None
+        if a.isdigit() and 1 <= int(a) <= len(options):
+            return options[int(a) - 1][0]
+
+
+def pinned(tool, start=None):
+    d = Path(start or os.getcwd()).resolve()
+    for p in [d] + list(d.parents):
+        f = p / '.rose'
+        if f.is_file():
+            for line in f.read_text().splitlines():
+                m = re.match(r'^\s*(claude|codex)\s*[=:]\s*([A-Za-z0-9_-]+)\s*$', line)
+                if m and m.group(1) == tool:
+                    return m.group(2)
+            return None
+    return None
+
+
+def active_in_shell(tool):
+    v = os.environ.get(HOME_VAR[tool])
+    if not v:
+        return os.environ.get('ROSE_' + tool.upper()) if (tool, os.environ.get('ROSE_' + tool.upper())) in accounts(tool) else None
+    for t, n in accounts(tool):
+        if account_home(t, n) == Path(v).resolve():
+            return n
+    return None
+
+
+def choose_account(tool, explicit=None):
+    if explicit:
+        return parse_spec(explicit, tool)[1]
+    names = [n for _, n in accounts(tool)]
+    if not names:
+        raise Error(f'no {LABEL[tool]} accounts yet: rose add {tool} <name>')
+    for how in (active_in_shell(tool), pinned(tool), settings().get('default', {}).get(tool)):
+        if how in names:
+            return how
+    if len(names) == 1:
+        return names[0]
+    cool = cooldowns()
+    opts = [(n, n + (f'  (limit until {clock(cool[tool + ":" + n]["until"])})' if f'{tool}:{n}' in cool else ''))
+            for n in names]
+    choice = pick(f'{LABEL[tool]} account:', opts)
+    if not choice:
+        raise Error('no account chosen')
+    return choice
+
+
+def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat_name=None):
+    """Run the native TUI under an account; handle usage-limit failover."""
+    if chat_name and not CHAT_NAME.match(chat_name):
+        raise Error('chat names: letters, digits, . - _ (no spaces), e.g. excel-calcs')
+    if chat_name and any(v.lower() == chat_name.lower() for v in chat_names().values()):
+        raise Error(f"'{chat_name}' is already used by another chat")
+    cwd = str(Path(cwd or os.getcwd()).resolve())
+    mode = failover_mode(tool, mode)
+    if mode == 'ask' and not sys.stdin.isatty():
+        mode = 'off'  # nobody to ask: never move a chat silently
+    tried = {name}
+    while True:
+        if not has_login(tool, name):
+            print(f'rose: {LABEL[tool]} account {name} has no login yet (rose login {tool} {name})', file=sys.stderr)
+        new_sid = str(uuid.uuid4()) if tool == 'claude' and not resume and not \
+            {'-r', '--resume', '-c', '--continue', '--session-id'} & set(args) else None
+        if chat_name and new_sid:
+            set_chat_name(tool, new_sid, chat_name)
+        cmd = build_cmd(tool, args, resume, new_sid, prompt)
+        print(f'rose: {LABEL[tool]} · {name}' + (f' · resuming {resume[:8]}' if resume else '') +
+              f' · failover {mode}', file=sys.stderr)
+        start = time.time()
+        killed = threading.Event()
+        done = threading.Event()
+        try:
+            proc = subprocess.Popen(cmd, env=environment(tool, name), cwd=cwd)
+        except FileNotFoundError:
+            raise Error(f'{BINARY[tool]} not found on PATH')
+        register(proc.pid, tool=tool, account=name, sid=resume or new_sid, cwd=cwd, started=start)
+        record('opened', tool=tool, account=name, session=resume or new_sid, cwd=cwd)
+
+        def watch():
+            while not done.wait(2):
+                path = current_transcript(tool, name, cwd, start, resume or new_sid)
+                if path and (claude_limit if tool == 'claude' else codex_limit)(path, start):
+                    time.sleep(1.5)  # let the tool finish writing the error
+                    killed.set()
+                    with contextlib.suppress(OSError):
+                        proc.terminate()
+                    return
+        if mode == 'auto':
+            threading.Thread(target=watch, daemon=True).start()
+        old = signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the TUI
+        try:
+            rc = proc.wait()
+        finally:
+            done.set()
+            signal.signal(signal.SIGINT, old)
+            unregister(proc.pid)
+        if killed.is_set():
+            restore_terminal()
+            rc = 0  # we closed it on purpose
+        elif rc < 0:
+            rc = 128 - rc
+
+        path = current_transcript(tool, name, cwd, start, resume or new_sid)
+        sid = None
+        if path:
+            sid = path.stem if tool == 'claude' else (codex_session(path, name) or {}).get('id')
+            if sid:
+                set_owner(tool, sid, name)
+                if chat_name and not chat_names().get(tool + ':' + sid):
+                    with contextlib.suppress(Error):
+                        set_chat_name(tool, sid, chat_name)
+        label = chat_names().get(f'{tool}:{sid}') or (sid or '')[:8]
+        info = path and (claude_limit if tool == 'claude' else codex_limit)(path, start)
+        if not info:
+            if sid:
+                print(f'rose: resume with: rose resume {label}' +
+                      ('' if label != sid[:8] else f'   (name it: rose name {label} <name>)'), file=sys.stderr)
+            return rc
+        until = float(info['reset']) if info.get('reset') else time.time() + DEFAULT_COOLDOWN
+        set_cooldown(tool, name, until, info['kind'])
+        record('limit', tool=tool, account=name, session=sid, until=until, kind=info['kind'])
+        print(f"rose: {LABEL[tool]} · {name} hit its {info['kind'].replace('_', '-')} limit "
+              f"(until {clock(until)}).", file=sys.stderr)
+        if mode == 'off' or not sid:
+            print(f'rose: failover is off. Later: rose resume {label} [--to ACCOUNT]', file=sys.stderr)
+            return rc
+        options = candidates(tool, tried)
+        if not options:
+            print(f'rose: no other {LABEL[tool]} account is available. Chat saved: rose resume {label}',
+                  file=sys.stderr)
+            return rc
+        target = options[0]
+        if mode == 'ask':
+            if len(options) > 1:
+                target = pick(f'Continue this chat on which {LABEL[tool]} account?', [(o, o) for o in options])
+            elif not ask(f'Continue this chat on {LABEL[tool]} · {target}?', default=True):
+                target = None
+            if not target:
+                print(f'rose: chat saved: rose resume {label}', file=sys.stderr)
+                return rc
+        row = next((r for r in sessions(tool, name) if r['id'] == sid), None)
+        if not row:
+            print(f'rose: could not find the saved chat {sid}', file=sys.stderr)
+            return rc
+        move(row, target, quiet=True, event='auto_switched' if mode == 'auto' else 'switched')
+        print(f'rose: moved chat {sid[:8]} {name} → {target}; continuing.', file=sys.stderr)
+        name, resume, prompt, args, chat_name = target, sid, CONTINUE_PROMPT, [], None
+        tried.add(target)
+
+
+def run_tool(tool, argv):
+    p = argparse.ArgumentParser(prog=f'rose {tool}', add_help=False)
+    p.add_argument('-a', '--account')
+    p.add_argument('--failover', choices=MODES)
+    p.add_argument('-n', '--name', dest='chat_name', help='name the new chat, e.g. excel-calcs')
+    p.add_argument('--rose-help', action='store_true')
+    known, rest = p.parse_known_args(argv)
+    if known.rose_help:
+        print(f'rose {tool} [-a ACCOUNT] [-n CHAT-NAME] [--failover off|ask|auto] [native {tool} args...]')
+        return 0
+    name = choose_account(tool, known.account)
+    if (rest and rest[0] in PASSTHROUGH[tool]) or NONINTERACTIVE_FLAGS[tool] & set(rest) or \
+            (tool == 'codex' and rest == ['resume']):
+        os.execvpe(BINARY[tool], [BINARY[tool]] + rest, environment(tool, name))
+    if tool == 'codex' and rest[:1] == ['resume'] and len(rest) > 1:
+        return resume_cmd([rest[1], '--tool', 'codex'] + (['--failover', known.failover] if known.failover else []))
+    return launch(tool, name, rest, mode=known.failover, chat_name=known.chat_name)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_add(a):
+    if not NAME.match(a.name):
+        raise Error('account names: letters, digits, - and _')
+    d = account_dir(a.tool, a.name)
+    if d.exists() or d.is_symlink():
+        raise Error(f'{a.tool}:{a.name} already exists')
+    private_dir(d.parent)
+    if a.adopt:
+        target = Path(a.adopt).expanduser().resolve()
+        if not target.is_dir():
+            raise Error(f'{target} is not a directory')
+        d.symlink_to(target)
+        print(f'{LABEL[a.tool]} account {a.name} uses existing home {target}')
+    else:
+        private_dir(d)
+        print(f'{LABEL[a.tool]} account {a.name} at {d}')
+        link_shared(a.tool, a.name)
+    ef = env_file(a.tool, a.name)
+    if not ef.exists():
+        private_dir(ef.parent)
+        ef.write_text('# Extra environment for this account (KEY=value), applied by rose.\n'
+                      '# e.g. an org API key or Bedrock: ANTHROPIC_API_KEY=...  CLAUDE_CODE_USE_BEDROCK=1\n')
+        ef.chmod(0o600)
+    record('added', tool=a.tool, account=a.name)
+    for w in shared_warnings() if a.tool == 'claude' else []:
+        print('WARNING: ' + w)
+    if not a.no_login and not has_login(a.tool, a.name):
+        return cmd_login(argparse.Namespace(tool=a.tool, name=a.name, device=a.device))
+    return 0
+
+
+def headless():
+    """No local browser: SSH session, or Linux without a display."""
+    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'):
+        return True
+    return sys.platform != 'darwin' and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'))
+
+
+def cmd_login(a):
+    tool, name = parse_spec(a.name, a.tool)
+    cmd = [BINARY[tool], 'auth', 'login'] if tool == 'claude' else [BINARY[tool], 'login']
+    device = getattr(a, 'device', None)
+    if tool == 'codex' and (device or (device is None and headless())):
+        cmd.append('--device-auth')  # browser on another device: open the URL, enter the code
+        print('No local browser here, so this uses a device code: open the link on any device and enter the code.')
+    print(f'Signing in {LABEL[tool]} · {name}. Choose the account you want for "{name}" in the browser.')
+    return subprocess.call(cmd, env=environment(tool, name))
+
+
+def cmd_logout(a):
+    tool, name = parse_spec(a.name, a.tool)
+    cmd = [BINARY[tool], 'auth', 'logout'] if tool == 'claude' else [BINARY[tool], 'logout']
+    return subprocess.call(cmd, env=environment(tool, name))
+
+
+def cmd_rm(a):
+    tool, name = parse_spec(a.name, a.tool)
+    d = account_dir(tool, name)
+    if d.is_symlink():
+        if ask(f'Forget adopted account {tool}:{name}? (its home {d.resolve()} is kept)'):
+            d.unlink()
+        return 0
+    if not ask(f'Delete {tool}:{name} including its login and chat history at {d}?'):
+        raise Error('aborted')
+    shutil.rmtree(d)
+    with contextlib.suppress(OSError):
+        env_file(tool, name).unlink()
+    record('removed', tool=tool, account=name)
+    print('removed (shared config untouched)')
+    return 0
+
+
+def cmd_status(a):
+    s = settings()
+    cool = cooldowns()
+    rows = sessions()
+    running = running_records()
+    for w in shared_warnings():
+        print('WARNING: ' + w + '\n')
+    for tool in TOOLS:
+        accs = accounts(tool)
+        print(f"{LABEL[tool]}  (failover: {s['failover'].get(tool, 'ask')}"
+              + (f", shell: {active_in_shell(tool)}" if active_in_shell(tool) else '')
+              + (f", pinned here: {pinned(tool)}" if pinned(tool) else '') + ')')
+        if not accs:
+            print(f'  no accounts (rose add {tool} <name>)')
+        for t, n in accs:
+            auth, email = identity(t, n) if not a.fast else ('login' if has_login(t, n) else 'no login', '')
+            c = cool.get(f'{t}:{n}')
+            chats = sum(1 for r in rows if r['tool'] == t and r['account'] == n)
+            live = sum(1 for r in running if r['tool'] == t and r['account'] == n)
+            bits = [auth] + ([email] if email else []) + [f'{chats} chats'] + \
+                   ([f'{live} open'] if live else []) + ([f"limit until {clock(c['until'])}"] if c else [])
+            print(f'  {n:<14} ' + ' · '.join(bits))
+            if t == 'claude':
+                print(f"  {'':<14} {usage_text(n)}")
+        print()
+    return 0
+
+
+def cmd_sessions(a):
+    rows = sessions(a.tool, a.account)
+    if not a.everywhere:  # prefer this directory's chats when there are any
+        here = str(Path.cwd().resolve())
+        rows = [r for r in rows if r['cwd'] == here] or rows
+    rows = rows[:a.limit]
+    if a.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print('no chats')
+    for r in rows:
+        proj = r['cwd'].replace(str(Path.home()), '~')
+        print(f"{ref(r):<16.16} {r['tool']:<6} {r['account']:<10} {ago(r['modified']):>8}  "
+              f"{'● ' if r['open'] else ''}{r['title']}   [{proj}]")
+    return 0
+
+
+def pick_session(tool=None):
+    rows = sessions(tool)[:25]
+    opts = [(r, f"{ref(r):<16.16} {r['tool']:<6} {r['account']:<10} {ago(r['modified']):>8}  {r['title']}  "
+                f"[{r['cwd'].replace(str(Path.home()), '~')}]") for r in rows]
+    if not opts:
+        raise Error('no chats yet')
+    row = pick('Chat:', opts)
+    if not row:
+        raise Error('no chat chosen')
+    return row
+
+
+def resume_cmd(argv):
+    p = argparse.ArgumentParser(prog='rose resume')
+    p.add_argument('id', nargs='?')
+    p.add_argument('--to', help='move to this account first')
+    p.add_argument('--tool', choices=TOOLS)
+    p.add_argument('--last', action='store_true', help='most recent chat in this directory')
+    p.add_argument('--failover', choices=MODES)
+    p.add_argument('--here', action='store_true', help='resume in the current directory')
+    a = p.parse_args(argv)
+    if a.last:
+        here = str(Path.cwd().resolve())
+        rows = [r for r in sessions(a.tool) if r['cwd'] == here] or sessions(a.tool)
+        if not rows:
+            raise Error('no chats yet')
+        row = rows[0]
+    else:
+        row = find_session(a.id, a.tool) if a.id else pick_session(a.tool)
+    if a.to:
+        target = parse_spec(a.to, row['tool'])[1]
+        if target != row['account']:
+            move(row, target)
+            row = dict(row, account=target)
+    cwd = Path.cwd() if a.here or not Path(row['cwd']).is_dir() else row['cwd']
+    return launch(row['tool'], row['account'], [], cwd=cwd, resume=row['id'], mode=a.failover)
+
+
+def cmd_move(a):
+    row = find_session(a.id, a.tool) if a.id else pick_session(a.tool)
+    target = parse_spec(a.to, row['tool'])[1] if a.to else pick(
+        'Move to:', [(n, n) for _, n in accounts(row['tool']) if n != row['account']])
+    if not target:
+        raise Error('no account chosen')
+    move(row, target)
+    print(f"Continue with: rose resume {ref(row)}")
+    return 0
+
+
+def cmd_name(a):
+    row = find_session(a.chat, a.tool) if a.chat else pick_session(a.tool)
+    if a.clear:
+        set_chat_name(row['tool'], row['id'], None)
+        print(f"Removed the name from chat {row['id'][:8]}.")
+        return 0
+    new = a.new or (input('  name (e.g. excel-calcs): ').strip() if sys.stdin.isatty() else '')
+    if not new:
+        raise Error('usage: rose name CHAT NEW-NAME')
+    set_chat_name(row['tool'], row['id'], new, force=a.force)
+    print(f"{LABEL[row['tool']]} chat {row['id'][:8]} ({row['title']}) is now '{new}'.  rose resume {new}")
+    return 0
+
+
+def cmd_failover(a):
+    s = settings()
+    if a.mode:
+        for t in ([a.tool] if a.tool else TOOLS):
+            s['failover'][t] = a.mode
+        save_settings(s)
+    for t in TOOLS:
+        print(f"{t}: {s['failover'].get(t, 'ask')}")
+    print('\noff  = never move chats; ask = offer to continue on another account when one hits its limit;\n'
+          'auto = move and continue automatically (closes the limited session for you).')
+    return 0
+
+
+def cmd_default(a):
+    s = settings()
+    if a.name:
+        tool, name = parse_spec(a.name, a.tool)
+        s.setdefault('default', {})[tool] = name
+        save_settings(s)
+    elif a.clear:
+        s.setdefault('default', {}).pop(a.tool, None)
+        save_settings(s)
+    for t in TOOLS:
+        print(f"{t}: {s.get('default', {}).get(t) or '(ask when there is more than one)'}")
+    return 0
+
+
+def cmd_order(a):
+    s = settings()
+    if a.names:
+        for n in a.names:
+            parse_spec(n, a.tool)
+        s.setdefault('order', {})[a.tool] = a.names
+        save_settings(s)
+    print(f"{a.tool} failover order: {' → '.join(s.get('order', {}).get(a.tool, [])) or '(account name order)'}")
+    return 0
+
+
+def cmd_defaults(a):
+    s = settings()
+    d = s['defaults'].setdefault(a.tool, {})
+    if a.clear:
+        d.clear()
+    if a.model is not None:
+        d['model'] = a.model
+    if a.effort is not None:
+        d['effort'] = a.effort
+    if a.yolo is not None:
+        d['yolo'] = a.yolo
+    save_settings(s)
+    print(f'{a.tool}: ' + (json.dumps(d) if d else '(native defaults)'))
+    print('applied as: ' + (' '.join(defaults_args(a.tool, [])) or '-'))
+    return 0
+
+
+def cmd_activity(a):
+    try:
+        lines = (ROOT / 'activity.jsonl').read_text().splitlines()[-a.limit:]
+    except OSError:
+        lines = []
+    for line in lines:
+        with contextlib.suppress(ValueError):
+            e = json.loads(line)
+            prev = f"{e['previous']} → " if e.get('previous') else ''
+            print(f"{e['time'][:16].replace('T', ' ')}  {e['event']:<13} {e.get('tool', ''):<6} "
+                  f"{prev}{e.get('account', '')}  {(e.get('session') or '')[:8]}  {e.get('title') or ''}")
+    return 0
+
+
+def cmd_sync(a):
+    for t, n in accounts(a.tool):
+        print(f'[{t}:{n}]')
+        link_shared(t, n)
+    for w in shared_warnings():
+        print('WARNING: ' + w)
+    return 0
+
+
+def cmd_env(a):
+    tool, name = parse_spec(a.name, a.tool)
+    print(env_file(tool, name))
+    return 0
+
+
+def cmd_pin(a):
+    tool, name = parse_spec(a.name, a.tool)
+    f = Path('.rose')
+    lines = [ln for ln in (f.read_text().splitlines() if f.exists() else [])
+             if not re.match(rf'^\s*{tool}\s*[=:]', ln)]
+    f.write_text('\n'.join(lines + [f'{tool}={name}']) + '\n')
+    print(f'{f.resolve()}: {tool}={name} (applies to this directory and below)')
+    return 0
+
+
+def emit(argv):
+    """Shell code for the integration function to eval."""
+    out = []
+    sub = argv[0] if argv else ''
+    if sub == 'use':
+        if len(argv) < 2:
+            raise Error('usage: rose use [claude|codex] NAME')
+        tool, name = (argv[1], argv[2]) if argv[1] in TOOLS and len(argv) > 2 else (None, argv[1])
+        tool, name = parse_spec(name, tool)
+        out += [f'unset {v};' for v in AUTH_ENV[tool]]
+        value = home_value(tool, name)
+        out.append(f'export {HOME_VAR[tool]}={shlex.quote(value)};' if value else f'unset {HOME_VAR[tool]};')
+        out.append(f'export ROSE_{tool.upper()}={shlex.quote(name)};')
+        for k, v in load_env_file(env_file(tool, name)).items():
+            if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', k):
+                out.append(f'export {k}={shlex.quote(v)};')
+        print(f'rose: {LABEL[tool]} → {name}', file=sys.stderr)
+    elif sub == 'off':
+        for t in ([argv[1]] if len(argv) > 1 and argv[1] in TOOLS else TOOLS):
+            out.append(f'unset {HOME_VAR[t]} ROSE_{t.upper()};')
+    elif sub == 'auto':
+        for t in TOOLS:
+            n = pinned(t)
+            if n and (t, n) in accounts(t) and os.environ.get('ROSE_' + t.upper()) != n:
+                out.append(f'eval "$(command rose __emit use {t} {shlex.quote(n)})";')
+    print('\n'.join(out))
+    return 0
+
+
+INIT = r'''# rose shell integration
+rose() {
+  case "${1:-}" in
+    use|off) eval "$(command rose __emit "$@")" ;;
+    *) command rose "$@" ;;
+  esac
+}
+_rose_auto() { eval "$(command rose __emit auto 2>/dev/null)"; }
+'''
+INIT_BASH = r'''_rose_prompt() { [ "$PWD" = "${_ROSE_PWD:-}" ] || { _ROSE_PWD="$PWD"; _rose_auto; }; }
+case ";${PROMPT_COMMAND:-};" in *";_rose_prompt;"*) ;; *) PROMPT_COMMAND="_rose_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;; esac
+'''
+INIT_ZSH = r'''autoload -Uz add-zsh-hook && add-zsh-hook chpwd _rose_auto
+_rose_auto
+'''
+
+
+def cmd_init(a):
+    print(INIT + (INIT_ZSH if a.shell == 'zsh' else INIT_BASH))
+    return 0
+
+
+def menu():
+    while True:
+        cool = cooldowns()
+        s = settings()
+        print('\nrose')
+        for tool in TOOLS:
+            names = [f"{n}{' (limit)' if f'{tool}:{n}' in cool else ''}" for _, n in accounts(tool)]
+            print(f"  {LABEL[tool]:<7} {', '.join(names) or '-'}   failover: {s['failover'].get(tool, 'ask')}")
+        choice = pick('', [('claude', 'New Claude chat'), ('codex', 'New Codex chat'), ('resume', 'Resume a chat'),
+                           ('move', 'Move a chat to another account'), ('status', 'Status'),
+                           ('failover', 'Change failover mode'), ('add', 'Add an account')])
+        if choice is None:
+            return 0
+        try:
+            if choice in TOOLS:
+                return launch(choice, choose_account(choice), [])
+            if choice == 'resume':
+                return resume_cmd([])
+            if choice == 'move':
+                cmd_move(argparse.Namespace(id=None, to=None, tool=None))
+            elif choice == 'status':
+                cmd_status(argparse.Namespace(fast=False))
+            elif choice == 'failover':
+                tool = pick('Tool:', [(t, LABEL[t]) for t in TOOLS])
+                mode = tool and pick('Mode:', [(m, m) for m in MODES])
+                if mode:
+                    cmd_failover(argparse.Namespace(tool=tool, mode=mode))
+            elif choice == 'add':
+                tool = pick('Tool:', [(t, LABEL[t]) for t in TOOLS])
+                if tool:
+                    name = input('  name (e.g. work, personal): ').strip()
+                    cmd_add(argparse.Namespace(tool=tool, name=name, adopt=None, no_login=False, device=None))
+        except Error as e:
+            print('rose: ' + str(e))
+
+
+def parser():
+    p = argparse.ArgumentParser(prog='rose', description='Switch Claude Code and Codex between accounts.',
+                                epilog='rose claude/codex [-a ACCOUNT] [--failover MODE] [native args...] '
+                                       'starts the native TUI under an account.')
+    p.add_argument('--version', action='version', version='rose ' + VERSION)
+    sub = p.add_subparsers(dest='cmd')
+    t = dict(choices=TOOLS)
+
+    s = sub.add_parser('add', help='add an account and sign in')
+    s.add_argument('tool', **t)
+    s.add_argument('name')
+    s.add_argument('--adopt', metavar='DIR', help='use an existing home (e.g. ~/.codex) instead of a new one')
+    s.add_argument('--no-login', action='store_true')
+    s.add_argument('--device', action='store_true', default=None, help='Codex: sign in with a device code')
+    s.set_defaults(fn=cmd_add)
+    s = sub.add_parser('login', help='sign in (Codex uses a device code automatically over SSH/headless)')
+    s.add_argument('tool', nargs='?', **t)
+    s.add_argument('name')
+    s.add_argument('--device', dest='device', action='store_true', default=None, help='force device-code sign-in')
+    s.add_argument('--browser', dest='device', action='store_false', help='force the normal browser sign-in')
+    s.set_defaults(fn=cmd_login)
+    for name, fn, h in (('logout', cmd_logout, 'sign out'),
+                        ('rm', cmd_rm, 'delete an account'), ('env', cmd_env, "print the account's env file")):
+        s = sub.add_parser(name, help=h)
+        s.add_argument('tool', nargs='?', **t)
+        s.add_argument('name')
+        s.set_defaults(fn=fn)
+    s = sub.add_parser('status', aliases=['list', 'ls', 'accounts'], help='accounts, logins, limits')
+    s.add_argument('--fast', action='store_true', help='skip asking the tools for login details')
+    s.set_defaults(fn=cmd_status)
+    s = sub.add_parser('sessions', aliases=['chats'], help='chats across all accounts')
+    s.add_argument('--tool', **t)
+    s.add_argument('--account')
+    s.add_argument('-n', '--limit', type=int, default=20)
+    s.add_argument('--all', '--everywhere', dest='everywhere', action='store_true', help='not just this directory')
+    s.add_argument('--json', action='store_true')
+    s.set_defaults(fn=cmd_sessions)
+    s = sub.add_parser('name', aliases=['rename'], help='name a chat: rose name CHAT excel-calcs')
+    s.add_argument('chat', nargs='?', help='chat id prefix or current name (omit for a picker)')
+    s.add_argument('new', nargs='?')
+    s.add_argument('--tool', **t)
+    s.add_argument('--clear', action='store_true')
+    s.add_argument('--force', action='store_true', help='take the name from another chat')
+    s.set_defaults(fn=cmd_name)
+    s = sub.add_parser('move', aliases=['switch'], help='move a chat to another account')
+    s.add_argument('id', nargs='?')
+    s.add_argument('--to')
+    s.add_argument('--tool', **t)
+    s.set_defaults(fn=cmd_move)
+    s = sub.add_parser('failover', help='off | ask | auto when an account hits its limit')
+    s.add_argument('tool', nargs='?', **t)
+    s.add_argument('mode', nargs='?', choices=MODES)
+    s.set_defaults(fn=cmd_failover)
+    s = sub.add_parser('default', help='account to use when nothing else picks one')
+    s.add_argument('tool', **t)
+    s.add_argument('name', nargs='?')
+    s.add_argument('--clear', action='store_true')
+    s.set_defaults(fn=cmd_default)
+    s = sub.add_parser('order', help='preferred failover order')
+    s.add_argument('tool', **t)
+    s.add_argument('names', nargs='*')
+    s.set_defaults(fn=cmd_order)
+    s = sub.add_parser('defaults', help='model/effort/permission defaults applied at launch')
+    s.add_argument('tool', **t)
+    s.add_argument('--model')
+    s.add_argument('--effort')
+    s.add_argument('--yolo', dest='yolo', action='store_true', default=None)
+    s.add_argument('--no-yolo', dest='yolo', action='store_false')
+    s.add_argument('--clear', action='store_true')
+    s.set_defaults(fn=cmd_defaults)
+    s = sub.add_parser('usage', help='live Claude plan usage per account; install/uninstall recording')
+    s.add_argument('action', nargs='?', choices=('install', 'uninstall'))
+    s.set_defaults(fn=cmd_usage)
+    s = sub.add_parser('activity', help='opens, limits, moves')
+    s.add_argument('-n', '--limit', type=int, default=30)
+    s.set_defaults(fn=cmd_activity)
+    s = sub.add_parser('sync', help='re-link shared config into accounts')
+    s.add_argument('tool', nargs='?', **t)
+    s.set_defaults(fn=cmd_sync)
+    s = sub.add_parser('pin', help='write .rose: this directory uses an account')
+    s.add_argument('tool', nargs='?', **t)
+    s.add_argument('name')
+    s.set_defaults(fn=cmd_pin)
+    s = sub.add_parser('init', help='print shell integration')
+    s.add_argument('shell', nargs='?', choices=('bash', 'zsh'), default='bash')
+    s.set_defaults(fn=cmd_init)
+    sub.add_parser('resume', help='resume any chat (picker, id prefix, --last, --to ACCOUNT)')
+    sub.add_parser('claude', help='start Claude Code under an account')
+    sub.add_parser('codex', help='start Codex under an account')
+    sub.add_parser('use', help='switch this shell: rose use [claude|codex] NAME  (needs rose init)')
+    sub.add_parser('off', help='back to the default ~/.claude / ~/.codex in this shell')
+    return p
+
+
+def main(argv):
+    try:
+        if not argv:
+            return menu() if sys.stdin.isatty() else parser().print_help()
+        c = argv[0]
+        if c in TOOLS:
+            return run_tool(c, argv[1:])
+        if c == 'resume':
+            return resume_cmd(argv[1:])
+        if c == 'statusline':
+            return cmd_statusline(argv[1:])
+        if c == '__emit':
+            return emit(argv[1:])
+        if c in ('use', 'off'):
+            raise Error(f"'rose {c}' changes your shell; add to ~/.bashrc: eval \"$(rose init bash)\"")
+        a = parser().parse_args(argv)
+        return a.fn(a)
+    except Error as e:
+        print('rose: ' + str(e), file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]) or 0)

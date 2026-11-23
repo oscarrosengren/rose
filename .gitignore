@@ -1,0 +1,12 @@
+# Never commit logins or account data (they live in ~/.local/share/rose, ~/.claude, ~/.codex)
+*.env
+.env*
+.credentials.json
+auth.json
+.claude.json
+accounts/
+usage/
+backups/
+.rose
+__pycache__/
+*.pyc
