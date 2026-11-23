@@ -387,7 +387,7 @@ class RoseTest(unittest.TestCase):
         r = self.rose('claude', 'hello')
         self.assertIn('starting on Codex · main', r.stderr)
         last = self.calls()[-1]
-        self.assertEqual((last['tool'], last['account'], last['args']), ('codex', 'main', ['hello']))
+        self.assertEqual((last['tool'], last['account'], last['args']), ('codex', 'main', ['--no-daemon', 'hello']))
         self.rose('claude', '-a', 'personal')                        # explicit choice still wins
         self.assertEqual(self.calls()[-1]['account'], 'personal')
 
@@ -407,7 +407,7 @@ class RoseTest(unittest.TestCase):
         self.set_usage('personal', 97)
         r = self.rose('chat', 'second task')
         self.assertIn('skipping Claude · personal (over threshold)', r.stderr)
-        self.assertEqual((self.calls()[-1]['tool'], self.calls()[-1]['args']), ('codex', ['second task']))
+        self.assertEqual((self.calls()[-1]['tool'], self.calls()[-1]['args']), ('codex', ['--no-daemon', 'second task']))
 
     def test_resume_over_threshold_moves_within_claude(self):
         self.rose('order', 'claude:personal', 'claude:work')
@@ -665,6 +665,17 @@ class RoseTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         r = self.rose('failover', 'codex', 'work', 'auto', check=False)       # codex has two accounts here
         self.assertIn('say which', r.stderr)
+
+    def test_codex_runs_without_shared_server(self):
+        self.rose('codex', '-a', 'main')
+        self.assertEqual(self.calls()[-1]['args'], ['--no-daemon'])
+        sid = json.loads(self.rose('sessions', '--json').stdout)[0]['id']
+        self.rose('resume', sid[:8])
+        self.assertEqual(self.calls()[-1]['args'][:2], ['resume', '--no-daemon'])
+        self.rose('codex', '-a', 'main', 'exec', 'hi')                   # non-interactive: untouched
+        self.assertEqual(self.calls()[-1]['args'], ['exec', 'hi'])
+        self.rose('codex', '-a', 'main', '--no-daemon')                  # not doubled
+        self.assertEqual(self.calls()[-1]['args'], ['--no-daemon'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

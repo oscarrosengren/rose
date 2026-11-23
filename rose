@@ -1067,9 +1067,17 @@ def build_cmd(tool, args, resume=None, new_sid=None, prompt=None):
         if resume:
             return [b, '--resume', resume] + extra + args + tail
         return [b] + (['--session-id', new_sid] if new_sid else []) + extra + args + tail
+    extra = no_daemon(args) + extra
     if resume:
         return [b, 'resume'] + extra + args + [resume] + tail
     return [b] + extra + args + tail
+
+
+def no_daemon(args):
+    """Codex's TUI uses a shared background server by default. It fails on installs without the full
+    package ("this CLI has no complete local package"), and a server shared by every account is not
+    what rose wants anyway: each chat gets its own (as codexx does with --no-daemon)."""
+    return [] if {'--no-daemon', '--remote'} & set(args) else ['--no-daemon']
 
 
 def set_title(text):
@@ -1520,6 +1528,8 @@ def run_tool(tool, argv):
                               mode=known.failover, chat_name=known.chat_name)
     if (rest and rest[0] in PASSTHROUGH[tool]) or NONINTERACTIVE_FLAGS[tool] & set(rest) or \
             (tool == 'codex' and rest == ['resume']):
+        if tool == 'codex' and rest[:1] in (['resume'], ['fork']):   # interactive pickers: no shared server
+            rest = rest[:1] + no_daemon(rest) + rest[1:]
         os.execvpe(BINARY[tool], [BINARY[tool]] + rest, environment(tool, name))
     if tool == 'codex' and rest[:1] == ['resume'] and len(rest) > 1:
         return resume_cmd([rest[1], '--tool', 'codex'] + (['--failover', known.failover] if known.failover else []))
