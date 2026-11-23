@@ -59,38 +59,51 @@ id prefixes still work.
 **Which account a launch uses**, first match wins: `-a NAME` → `rose use` in this shell → `.rose` pin
 → `rose default` → the only account → a picker.
 
-## When an account hits its usage limit
+## Order, threshold and failover
 
 ```sh
-rose failover claude ask      # default: ask before continuing on another account
-rose failover claude auto     # move and continue without asking
-rose failover codex off       # never move
-rose order claude work personal   # preferred order when more than two
+rose order claude:personal codex:main claude:work   # one order across both tools
+rose threshold 95                                    # skip Claude accounts at/above 95% (5h or week)
+rose chat "fix the tests"                            # new chat on the first available account in the order
+rose failover claude ask                             # ask (default) | auto | off, per tool
 ```
 
-- **ask:** after you leave the limited session, rose shows the reset time and asks
-  `Continue this chat on Claude · personal? [Y/n]`. If you answer yes, it copies the chat and resumes it there.
-- **auto:** rose watches the transcript. When the limit error appears, it closes the session, copies the
-  chat, and resumes it on the next account with a "continue where you stopped" prompt.
-- The limited account gets a cooldown until its reset time (`rose status`). Each account is tried
-  once per chat. If all of them are limited, rose stops and tells you how to resume later.
-- Only real usage-limit errors trigger this, not other errors. Limits are detected from Claude's
-  `usage_limit_reached` entry and Codex's usage-limit error event.
+- **New chats:** `rose chat` starts on the first account in the order that is signed in, not limited
+  and under the threshold. `rose claude` with no `-a` uses your default, but moves on in the order
+  if that account is over the threshold. In `ask` mode it asks first. An explicit `-a` always wins.
+- **Usage limit hit:** the chat continues on the next account in the order. If that account uses the
+  same tool, the chat is moved and resumed with its full history. If it uses the other tool, a new chat
+  starts in the same folder with the conversation so far handed over (newest messages kept, about
+  40k characters). It is told to check the folder before repeating anything. A chat name moves with it.
+- **Resuming** a chat whose account is over the threshold or limited works the same way.
+- **ask:** after you leave the limited session, rose asks before continuing elsewhere.
+  **auto:** rose closes the limited session itself and continues. **off:** nothing moves.
+- **Over the threshold mid-chat:** the status line shows `⚠ personal 96% → exit; next: main`. rose doesn't
+  close a running chat for this, because you might be typing. The hard limit still fails over right away.
+- The limited account gets a cooldown until its reset time. Each account is tried once per chat.
 
-## Live Claude usage
+## Usage
 
 ```sh
-rose usage install     # once: record plan usage via Claude Code's status line (your status line looks the same)
-rose usage             # personal  5h 42% (resets 20:50) · week 63% (resets Mon 09:00) · seen 2m ago
-rose status            # same, next to each account's login and chats
+rose usage install     # once: record Claude plan usage via the status line (it looks the same)
+rose usage             # every account, in your order, with bars
 rose usage uninstall   # restore the original status line
 ```
 
-Claude Code gives its status line command the plan's 5-hour and weekly usage (`rate_limits`). rose
-records it per account and then runs your original status line command. It updates whenever a chat
-on that account is open; otherwise you see the last value and how old it is. After a window's reset
-time passes, it shows "reset". Failover skips accounts known to be at 100% and prefers the least-used one.
-Only subscription logins report usage (API keys don't).
+```
+Claude · personal      #1 in order
+  5h    ██████░░░░░░░░░░░░░░░░░░   27%  resets 02:30
+  week  ███████░░░░░░░░░░░░░░░░░   28%  resets Sun 01:00
+        seen 1m ago
+```
+
+- **Claude:** Claude Code gives its status line the plan's 5-hour and weekly usage. rose records it
+  per account and then runs your original status line command.
+- **Codex:** read from the rate-limit snapshots Codex writes into its own session files.
+
+Neither needs network calls or tokens. Values are as last seen, updated while chats run. Once a
+window's reset time passes, it shows "reset". Bars turn yellow and then red as usage rises (red at the
+Claude threshold). Only subscription logins report usage (API keys don't).
 
 ## Defaults and per-account environment
 
@@ -109,8 +122,11 @@ account's env file. `rose status` warns if `~/.claude/settings.json` sets a key 
 - **No switching mid-turn.** codexx swaps a Codex backend underneath an open terminal. Claude Code has no
   such interface, so rose restarts the native TUI with `--resume` instead. The history is kept, but the
   screen is redrawn.
-- **Usage is "last seen", not polled.** Claude usage is recorded while chats run (see above). Codex
-  usage isn't shown; use `/status` inside Codex.
+- **Usage is "last seen", not polled.** It's recorded while chats run, so idle accounts show their last value.
+- **No switching mid-chat at the threshold.** codexx switches before a new message is sent. rose only warns in
+  the status line, and applies the threshold when you start, resume or fail over.
+- **Handoffs between tools are a summary, not a resume.** The new tool gets the conversation text, but not
+  the other tool's internal state.
 - **Claude may ask you to confirm** when a chat continues under a different account.
   That is Claude Code's own session-owner check, and rose leaves it in place.
 - **Not included:** the Desktop app, the web dashboard and the self-updater.

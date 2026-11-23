@@ -177,7 +177,7 @@ class RoseTest(unittest.TestCase):
     def test_all_accounts_limited_stops(self):
         self.rose('failover', 'claude', 'auto')
         r = self.rose('claude', '-a', 'work', env={'FAKE_LIMITED': 'work,personal', 'FAKE_HANG': '1'})
-        self.assertIn('no other Claude account', r.stderr)
+        self.assertIn('no other account is available', r.stderr)
         self.assertEqual(len([c for c in self.calls() if c['tool'] == 'claude' and c['args'][:1] != ['auth']]), 2)
 
     def test_ask_mode_without_terminal_never_moves(self):
@@ -306,7 +306,7 @@ class RoseTest(unittest.TestCase):
         status = self.rose('status', '--fast').stdout
         self.assertIn('5h 42%', status)
         self.assertIn('week 63%', status)
-        self.assertIn('usage: unknown', status)                   # personal never ran
+        self.assertIn('no usage seen yet', status)                 # personal never ran
         self.rose('usage', 'uninstall')
         self.assertEqual(json.loads(settings.read_text())['statusLine']['command'],
                          'cat >/dev/null; echo ORIGINAL-LINE')
@@ -330,6 +330,111 @@ class RoseTest(unittest.TestCase):
         self.assertEqual(self.calls()[-1]['args'], ['login'])
         self.rose('login', 'claude', 'work', env={'SSH_CONNECTION': '1 2 3 4'})
         self.assertEqual(self.calls()[-1]['args'], ['auth', 'login'])
+
+    def set_usage(self, account, five, week=10):
+        self.rose('statusline', input=self.statusline_input(five, week), env={'ROSE_CLAUDE': account})
+
+    def test_order_requires_tool_and_accepts_old_form(self):
+        self.assertIn('say which tool', self.rose('order', 'personal', check=False).stderr)
+        out = self.rose('order', 'claude:personal', 'codex:main', 'claude:work').stdout
+        self.assertIn('Claude · personal → Codex · main → Claude · work', out)
+        self.assertIn('Order: Claude · personal', self.rose('status', '--fast').stdout)
+
+    def test_limit_hands_over_to_codex_next_in_order(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.rose('failover', 'claude', 'auto')
+        r = self.rose('claude', '-a', 'personal', '--name', 'excel-calcs', 'build the sheet',
+                      env={'FAKE_LIMITED': 'personal', 'FAKE_HANG': '1'})
+        self.assertIn('to Codex · main', r.stderr)
+        last = self.calls()[-1]
+        self.assertEqual((last['tool'], last['account']), ('codex', 'main'))
+        self.assertIn('[rose handoff]', last['args'][-1])
+        self.assertIn('build the sheet', last['args'][-1])          # earlier conversation carried over
+        self.assertNotIn("You've hit your limit", last['args'][-1])  # the error itself is not
+        rows = json.loads(self.rose('sessions', '--json', '--all').stdout)
+        named = [x for x in rows if x['name'] == 'excel-calcs']
+        self.assertEqual([(x['tool'], x['account']) for x in named], [('codex', 'main')])  # name followed
+
+    def test_codex_limit_continues_on_claude_work(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.rose('failover', 'codex', 'auto')
+        self.rose('codex', '-a', 'main', env={'FAKE_LIMITED': 'main', 'FAKE_HANG': '1'})
+        last = self.calls()[-1]
+        self.assertEqual((last['tool'], last['account']), ('claude', 'work'))
+        self.assertIn('[rose handoff]', last['args'][-1])
+
+    def test_threshold_new_chat_starts_on_next_in_order(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.rose('default', 'claude', 'personal')
+        self.rose('threshold', '95')
+        self.rose('failover', 'claude', 'auto')
+        self.set_usage('personal', 96)
+        r = self.rose('claude', 'hello')
+        self.assertIn('starting on Codex · main', r.stderr)
+        last = self.calls()[-1]
+        self.assertEqual((last['tool'], last['account'], last['args']), ('codex', 'main', ['hello']))
+        self.rose('claude', '-a', 'personal')                        # explicit choice still wins
+        self.assertEqual(self.calls()[-1]['account'], 'personal')
+
+    def test_threshold_ask_mode_without_terminal_does_not_switch(self):
+        self.rose('order', 'claude:personal', 'codex:main')
+        self.rose('default', 'claude', 'personal')
+        self.rose('threshold', '95')
+        self.set_usage('personal', 99)
+        self.rose('claude')
+        self.assertEqual(self.calls()[-1]['account'], 'personal')
+
+    def test_rose_chat_uses_first_available(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.rose('threshold', '95')
+        self.rose('chat', 'first task')
+        self.assertEqual(self.calls()[-1]['account'], 'personal')
+        self.set_usage('personal', 97)
+        r = self.rose('chat', 'second task')
+        self.assertIn('skipping Claude · personal (over threshold)', r.stderr)
+        self.assertEqual((self.calls()[-1]['tool'], self.calls()[-1]['args']), ('codex', ['second task']))
+
+    def test_resume_over_threshold_moves_within_claude(self):
+        self.rose('order', 'claude:personal', 'claude:work')
+        self.rose('threshold', '95')
+        self.rose('failover', 'claude', 'auto')
+        self.rose('claude', '-a', 'personal', '-n', 'notes')
+        self.set_usage('personal', 95)
+        r = self.rose('resume', 'notes')
+        self.assertIn('continuing on Claude · work', r.stderr)
+        last = self.calls()[-1]
+        self.assertEqual((last['account'], last['args'][0]), ('work', '--resume'))
+
+    def test_statusline_warns_over_threshold(self):
+        self.rose('order', 'claude:personal', 'codex:main')
+        self.rose('threshold', '95')
+        out = self.rose('statusline', input=self.statusline_input(96, 20), env={'ROSE_CLAUDE': 'personal'}).stdout
+        self.assertIn('⚠ personal 96%', out)
+        self.assertIn('next: main', out)
+
+    def test_usage_shows_all_accounts_with_bars(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.set_usage('personal', 50, 25)
+        d = self.home('codex', 'main') / 'sessions' / '2026' / '11' / '23'
+        d.mkdir(parents=True)
+        sid = '11111111-2222-3333-4444-555555555555'
+        reset = int(time.time()) + 7200
+        (d / f'rollout-2026-11-23T10-00-00-{sid}.jsonl').write_text('\n'.join(json.dumps(x) for x in [
+            {'type': 'session_meta', 'timestamp': '2026-11-23T10:00:00Z', 'payload': {'id': sid, 'cwd': '/tmp'}},
+            {'type': 'event_msg', 'timestamp': '2026-11-23T10:01:00Z', 'payload': {
+                'type': 'token_count', 'rate_limits': {
+                    'primary': {'used_percent': 75.0, 'window_minutes': 300, 'resets_at': reset},
+                    'secondary': {'used_percent': 10.0, 'window_minutes': 10080, 'resets_in_seconds': 86400}}}},
+        ]) + '\n')
+        out = self.rose('usage').stdout
+        self.assertLess(out.index('Claude · personal'), out.index('Codex · main'))
+        self.assertLess(out.index('Codex · main'), out.index('Claude · work'))
+        self.assertIn('#1 in order', out)
+        self.assertIn('█' * 12 + '░' * 12 + '   50%', out)          # personal 5h
+        self.assertIn('█' * 18 + '░' * 6 + '   75%', out)          # codex 5h from its session file
+        self.assertIn('no usage seen yet', out)                      # work never ran
+        self.assertIn('Codex · spare', out)                          # accounts outside the order too
+        self.assertIn('5h 75%', self.rose('status', '--fast').stdout)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
