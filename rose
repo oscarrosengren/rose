@@ -960,9 +960,20 @@ def move(row, target, quiet=False, event='moved'):
 
 # ---------------------------------------------------------------- usage-limit detection
 
+ISO = re.compile(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?$')
+
+
 def iso_ts(value):
+    """ISO-8601 timestamp -> epoch seconds; 0 if unreadable. Works on Python 3.9, whose fromisoformat
+    rejects 'Z' and fractions other than 3 or 6 digits (Claude and Codex write both)."""
+    m = ISO.match(str(value).strip())
+    if not m:
+        return 0
+    frac = ((m.group(2) or '') + '000000')[:6]
+    zone = m.group(3) or '+00:00'
+    zone = '+00:00' if zone == 'Z' else (zone if ':' in zone else zone[:3] + ':' + zone[3:])
     try:
-        return dt.datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+        return dt.datetime.fromisoformat(f'{m.group(1)}.{frac}{zone}').timestamp()
     except ValueError:
         return 0
 
