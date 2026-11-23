@@ -145,30 +145,94 @@ Names are case-insensitive and unique (letters, digits, `.`, `-`, `_`), and stay
 moves, including to the other tool. `rose resume` also accepts a title you set in Claude with `/rename`,
 or the first characters of a chat id.
 
-## Order, threshold and failover
+## Order, threshold and switching
 
 ```sh
-rose order claude:personal codex:main claude:work   # one order across both tools
-rose threshold 95                                    # skip Claude accounts at/above 95% (5h or week)
-rose failover claude ask                             # ask (default) | auto | off, per tool
+rose order claude:personal codex:main claude:work   # your order, across both tools
+rose order --from next        # on a switch, continue after the current account (default)
+rose order --from top         # on a switch, always start again at #1
+rose threshold 95             # skip Claude accounts at/above 95% (5-hour or weekly)
+rose failover                 # show how every switch is handled
 ```
 
-- **New chats:** `rose chat` starts on the first account in the order that is signed in, not limited
-  and under the threshold.
-- **Usage limit hit:** the chat continues on the next account in the order. If that account uses the
-  same tool, the chat is moved and resumed with its full history. If it uses the other tool, a new chat
-  starts in the same folder with the conversation so far handed over (newest messages kept, about
-  40k characters). It is told to check the folder before repeating anything.
-- **Resuming** a chat whose account is over the threshold or limited works the same way.
-- **ask:** after you leave the limited chat, rose asks before continuing elsewhere.
-  **auto:** rose closes the limited chat itself and continues. **off:** nothing moves.
-- **Over the threshold mid-chat:** the status line shows `⚠ personal 96% → type 'move' (main)`. rose
-  doesn't close a running chat for this, because you might be typing. The hard limit still fails over
-  right away.
-- A limited account is skipped until its reset time. Each account is tried once per chat.
+**When rose switches:** an account hits its usage limit, or you start or resume a chat on an account
+that is over the threshold. If the next account uses the same tool, the chat is moved and resumed
+with its full history. If it uses the other tool, a new chat starts in the same folder with the
+conversation so far handed over (newest messages kept, about 40k characters). It is told to check the
+folder before repeating anything. A chat name moves with the chat. A limited account is skipped until
+its reset time, and each account is tried once per chat.
+
+**Where it switches to.** With the order personal → Codex → work, if you're on Codex and it runs out:
+
+| Setting | Goes to |
+|---|---|
+| `--from next` (default) | work, then personal (continues after Codex, wraps around) |
+| `--from top` | personal, then work (back to #1 whenever it has quota) |
+
+Accounts at or above the threshold come last either way.
+
+### Ask, auto or off
+
+Each switch is `ask` (rose asks you first), `auto` (rose switches by itself) or `off` (never).
+
+```sh
+# Simple: one setting per tool, for switches away from that tool
+rose failover all ask                 # every switch
+rose failover claude auto             # switches away from Claude accounts
+rose failover codex ask
+
+# Advanced: a setting per switch, between two accounts
+rose failover personal codex auto     # personal → Codex: automatic
+rose failover codex work ask          # Codex → work: ask first
+rose failover personal work off       # never move a personal chat to work
+rose failover personal work default   # remove that rule again
+rose failover advanced off            # back to simple (rules are kept for later)
+```
+
+Setting a rule turns on advanced mode. Any switch without its own rule uses the simple setting for the
+tool it switches away from. `rose failover` lists every switch and how it's handled:
+
+```
+  Mode:   advanced (per switch)
+    Claude · personal  → Codex · main       auto
+    Claude · personal  → Claude · work      off
+    Codex · main       → Claude · work      ask   (default for Codex)
+```
+
+### What "ask" looks like
+
+**A chat hits its limit.** The app shows its usual limit message. Leave it (`/exit`, or Ctrl-C twice)
+and rose asks right there in the terminal:
+
+```
+rose: Claude · personal hit its five-hour limit (until 20:50).
+Continue on which account?
+   1) Codex · main       (new chat with this conversation handed over)
+   2) Claude · work      (moves this chat)
+  choose (enter = 1, n = stay here, keep the chat): 
+rose: handing chat excel-calcs over from Claude · personal to Codex · main.
+🌹 rose · Codex · main · excel-calcs · failover ask · type 'move' to switch account
+```
+
+With a single possible account it's a yes/no question instead:
+`Continue on Codex · main (new chat with this conversation handed over)? [Y/n]`. Enter means yes. If
+you answer `n`, the chat is saved and `rose resume excel-calcs` continues it later.
+
+**Starting or resuming on an account over the threshold:**
+
+```
+personal is at 96% (threshold 95%). Start on Codex · main instead? [Y/n] n
+```
+
+With `auto` you see no question: rose closes the limited chat itself as soon as the limit appears,
+and the next chat opens. Without a terminal (scripts), `ask` never switches.
+
+**Over the threshold mid-chat:** the status line shows `⚠ personal 96% → type 'move' (main)`. rose
+doesn't close a running chat for this, because you might be typing. The hard limit still switches
+right away.
 
 With `auto`, a chat can continue on an account you might want to keep separate, for example from
-personal to work. Keep `ask` if that matters, or leave that account out of the order.
+personal to work. Use `ask` or `off` for that switch in advanced mode.
 
 ## Usage
 

@@ -1112,8 +1112,9 @@ def ask(question, default=False):
     return default if not a else a in ('y', 'yes')
 
 
-def pick(title, options, allow_none=True):
-    """Numbered picker. options: list of (value, label). Returns value or None."""
+def pick(title, options, allow_none=True, enter_first=False, cancel_word='cancel'):
+    """Numbered picker. options: list of (value, label). Returns value or None.
+    enter_first: Enter picks option 1 and 'n' cancels (used for switching, where yes is the default)."""
     if not options:
         return None
     if not sys.stdin.isatty():
@@ -1121,12 +1122,17 @@ def pick(title, options, allow_none=True):
     print(title)
     for i, (_, label) in enumerate(options, 1):
         print(f'  {i:>2}) {label}')
+    hint = f' (enter = 1, n = {cancel_word})' if enter_first else (' (enter = cancel)' if allow_none else '')
     while True:
         try:
-            a = input('  choose' + (' (enter = cancel)' if allow_none else '') + ': ').strip()
+            a = input('  choose' + hint + ': ').strip().lower()
         except EOFError:
             return None
-        if not a and allow_none:
+        if enter_first and not a:
+            return options[0][0]
+        if enter_first and a in ('n', 'no', 'q'):
+            return None
+        if not a and allow_none and not enter_first:
             return None
         if a.isdigit() and 1 <= int(a) <= len(options):
             return options[int(a) - 1][0]
@@ -1187,16 +1193,53 @@ def usable(tool, name):
 
 
 def next_targets(tool, name, tried=()):
-    """Where to go from (tool, name): your order first (any tool), else other accounts of the same tool.
-    Accounts under the threshold come first; ones over it are a last resort."""
+    """Where to go from (tool, name): your order (any tool), else other accounts of the same tool.
+    `rose order --from next` (default) continues after the current account and wraps around;
+    `--from top` always starts again at #1. Accounts over the threshold are a last resort."""
     order = chain()
     if order:
-        i = order.index((tool, name)) + 1 if (tool, name) in order else 0
-        pool = order[i:] + order[:i]
+        if settings().get('order_from', 'next') == 'top':
+            pool = list(order)
+        else:
+            i = order.index((tool, name)) + 1 if (tool, name) in order else 0
+            pool = order[i:] + order[:i]
     else:
         pool = [(tool, n) for n in candidates(tool, set())]
     pool = [a for a in pool if a != (tool, name) and a not in tried and usable(*a)]
     return [a for a in pool if not over_threshold(*a)] + [a for a in pool if over_threshold(*a)]
+
+
+def rule_key(src, dst):
+    return f'{src[0]}:{src[1]}>{dst[0]}:{dst[1]}'
+
+
+def mode_for(src, dst, override=None):
+    """ask / auto / off for switching a chat from account src to account dst."""
+    if override in MODES:
+        return override
+    s = settings()
+    if s.get('failover_advanced'):
+        rule = s.get('failover_rules', {}).get(rule_key(src, dst))
+        if rule in MODES:
+            return rule
+    mode = s['failover'].get(src[0], 'ask')
+    return mode if mode in MODES else 'ask'
+
+
+def switch_targets(tool, name, tried=(), override=None):
+    """[(account, mode)] in the order rose would try them; switches set to 'off' are left out."""
+    out = []
+    for t in next_targets(tool, name, tried):
+        m = mode_for((tool, name), t, override)
+        if m != 'off':
+            out.append((t, m))
+    return out
+
+
+def failover_label(tool, override=None):
+    if override:
+        return override
+    return 'custom' if settings().get('failover_advanced') else failover_mode(tool)
 
 
 def first_available(tried=()):
@@ -1299,9 +1342,7 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
             adopt_new_code(dict(tool=tool, name=name, args=args, cwd=cwd, resume=resume, prompt=prompt,
                                 mode=override, chat_name=chat_name, tried=sorted(tried)))
         first = False
-        mode = failover_mode(tool, override)
-        if mode == 'ask' and not sys.stdin.isatty():
-            mode = 'off'  # nobody to ask: never move a chat silently
+        mode = failover_label(tool, override)
         if not has_login(tool, name):
             print(f'rose: {LABEL[tool]} account {name} has no login yet (rose login {tool} {name})', file=sys.stderr)
         new_sid = str(uuid.uuid4()) if tool == 'claude' and not resume and not \
@@ -1336,7 +1377,7 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
             with contextlib.suppress(OSError):
                 proc.terminate()
 
-        def watch(tool=tool, name=name, start=start, sid=resume or new_sid, mode=mode):
+        def watch(tool=tool, name=name, start=start, sid=resume or new_sid, tried=frozenset(tried)):
             ticks = 0
             while not done.wait(0.5):
                 ticks += 1
@@ -1348,11 +1389,14 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
                 if target:
                     request['target'] = target
                     return stop()
-                if mode == 'auto' and ticks % 4 == 0:
+                if ticks % 4 == 0:
                     path = path or current_transcript(tool, name, cwd, start, sid)
                     if path and (claude_limit if tool == 'claude' else codex_limit)(path, start):
-                        time.sleep(1)  # let the tool finish writing the error
-                        return stop()
+                        plan = switch_targets(tool, name, tried | {(tool, name)}, override)
+                        if plan and plan[0][1] == 'auto':      # the next switch is automatic: do it now
+                            time.sleep(1)  # let the tool finish writing the error
+                            return stop()
+                        return                                  # ask: wait for the user to leave the chat
         threading.Thread(target=watch, daemon=True).start()
         old = signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the TUI
         try:
@@ -1401,24 +1445,28 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
             record('limit', tool=tool, account=name, session=sid, until=until, kind=info['kind'])
             print(f"rose: {LABEL[tool]} · {name} hit its {info['kind'].replace('_', '-')} limit "
                   f"(until {clock(until)}).", file=sys.stderr)
-            if mode == 'off' or not sid:
-                print(f'rose: failover is off. Later: rose resume {label} [--to ACCOUNT]', file=sys.stderr)
+            plan = switch_targets(tool, name, tried, override) if sid else []
+            if not plan:
+                why = 'no other account is available' if sid and next_targets(tool, name, tried) == [] \
+                    else 'switching is off for this account'
+                print(f'rose: {why}. Chat saved: rose resume {label} [--to ACCOUNT]', file=sys.stderr)
                 return rc
-            options = next_targets(tool, name, tried)
-            if not options:
-                print(f'rose: no other account is available. Chat saved: rose resume {label}', file=sys.stderr)
-                return rc
-            target = options[0]
+            target, how_mode = plan[0]
             how = lambda a: 'moves this chat' if a[0] == tool else 'new chat with this conversation handed over'
-            if mode == 'ask':
-                if len(options) > 1:
-                    target = pick('Continue on which account?', [(o, f'{spec(o)}  ({how(o)})') for o in options])
+            if how_mode == 'ask':
+                if not sys.stdin.isatty():
+                    print(f'rose: chat saved: rose resume {label}', file=sys.stderr)  # nobody to ask
+                    return rc
+                if len(plan) > 1:
+                    target = pick('Continue on which account?',
+                                  [(o, f'{spec(o):<18} ({how(o)})') for o, _ in plan],
+                                  enter_first=True, cancel_word='stay here, keep the chat')
                 elif not ask(f'Continue on {spec(target)} ({how(target)})?', default=True):
                     target = None
                 if not target:
                     print(f'rose: chat saved: rose resume {label}', file=sys.stderr)
                     return rc
-            event, reason = ('auto_switched' if mode == 'auto' else 'switched'), 'limit'
+            event, reason = ('auto_switched' if how_mode == 'auto' else 'switched'), 'limit'
 
         if target[0] == tool:
             row = next((r for r in sessions(tool, name) if r['id'] == sid), None)
@@ -1456,12 +1504,13 @@ def run_tool(tool, argv):
         return 0
     name = choose_account(tool, known.account)
     passthrough = (rest and rest[0] in PASSTHROUGH[tool]) or NONINTERACTIVE_FLAGS[tool] & set(rest)
-    if not known.account and not passthrough and over_threshold(tool, name) and \
-            failover_mode(tool, known.failover) != 'off':
-        target = (next_targets(tool, name) or [None])[0]
-        if target and not over_threshold(*target):
+    plan = switch_targets(tool, name, (), known.failover) if not known.account and not passthrough and \
+        over_threshold(tool, name) else []
+    if plan:
+        target, how_mode = plan[0]
+        if not over_threshold(*target):
             msg = f'{name} is at {max_used(name):.0f}% (threshold {threshold(tool)}%)'
-            if failover_mode(tool, known.failover) == 'auto' or \
+            if how_mode == 'auto' or \
                     (sys.stdin.isatty() and ask(f'{msg}. Start on {spec(target)} instead?', default=True)):
                 print(f'rose: {msg}; starting on {spec(target)}.', file=sys.stderr)
                 bare = rest if len(rest) == 1 and not rest[0].startswith('-') else []
@@ -1564,7 +1613,7 @@ def cmd_status(a):
         print()
     for tool in TOOLS:
         accs = accounts(tool)
-        print(f"{LABEL[tool]}  (failover: {s['failover'].get(tool, 'ask')}"
+        print(f"{LABEL[tool]}  (failover: {failover_label(tool)}"
               + (f", shell: {active_in_shell(tool)}" if active_in_shell(tool) else '')
               + (f", pinned here: {pinned(tool)}" if pinned(tool) else '') + ')')
         if not accs:
@@ -1636,12 +1685,12 @@ def resume_cmd(argv):
             row = dict(row, account=target)
     cwd = Path.cwd() if a.here or not Path(row['cwd']).is_dir() else row['cwd']
     src = (row['tool'], row['account'])
-    mode = failover_mode(row['tool'], a.failover)
-    if not a.to and mode != 'off' and (over_threshold(*src) or not usable(*src)):
-        target = (next_targets(*src) or [None])[0]
+    plan = switch_targets(*src, (), a.failover) if not a.to and (over_threshold(*src) or not usable(*src)) else []
+    if plan:
+        target, how_mode = plan[0]
         why = (f"is at {max_used(src[1]):.0f}% (threshold {threshold(src[0])}%)" if over_threshold(*src)
                else 'is at its limit')
-        if target and (mode == 'auto' or
+        if target and (how_mode == 'auto' or
                        (sys.stdin.isatty() and ask(f'{spec(src)} {why}. Continue on {spec(target)}?', default=True))):
             print(f'rose: {spec(src)} {why}; continuing on {spec(target)}.', file=sys.stderr)
             if target[0] == row['tool']:
@@ -1896,17 +1945,78 @@ def cmd_name(a):
     return 0
 
 
-def cmd_failover(a):
+def resolve_account(word):
+    """'personal', 'claude:work', or a tool name when that tool has one account ('codex')."""
+    if word in TOOLS:
+        accs = accounts(word)
+        if len(accs) == 1:
+            return accs[0]
+        raise Error(f"{LABEL[word]} has {len(accs)} accounts; say which, e.g. {word}:{accs[0][1] if accs else 'main'}")
+    return parse_spec(word)
+
+
+def show_failover():
     s = settings()
-    if a.mode:
-        for t in ([a.tool] if a.tool else TOOLS):
-            s['failover'][t] = a.mode
-        save_settings(s)
-    for t in TOOLS:
-        print(f"{t}: {s['failover'].get(t, 'ask')}")
-    print('\noff  = never move chats; ask = offer to continue on another account when one hits its limit;\n'
-          'auto = move and continue automatically (closes the limited session for you).')
+    order = chain()
+    adv = s.get('failover_advanced')
+    print('Switching accounts (on a usage limit, or over the threshold when starting/resuming)\n')
+    if order:
+        how = 'always from #1' if s.get('order_from') == 'top' else 'continuing after the current account'
+        print(f"  Order:  {' → '.join(spec(x) for x in order)}   ({how})")
+    print(f"  Mode:   {'advanced (per switch)' if adv else 'simple (per tool)'}")
+    if not adv:
+        for t in TOOLS:
+            print(f"    from {LABEL[t]:<7} {s['failover'].get(t, 'ask')}")
+    else:
+        rules = s.get('failover_rules', {})
+        everyone = order + [a for a in accounts() if a not in order]
+        for src in everyone:
+            for dst in everyone:
+                if src != dst:
+                    m = mode_for(src, dst)
+                    tag = '' if rule_key(src, dst) in rules else '   (default for ' + LABEL[src[0]] + ')'
+                    print(f'    {spec(src):<18} → {spec(dst):<18} {m}{tag}')
+    print('\n  ask  = rose asks you before switching   auto = rose switches by itself   off = never')
     return 0
+
+
+def cmd_failover(argv):
+    """rose failover                          show
+       rose failover MODE | all MODE          every switch
+       rose failover claude|codex MODE        switches away from that tool (simple mode)
+       rose failover FROM TO MODE             one switch, e.g. personal codex auto (turns on advanced)
+       rose failover FROM TO default          remove that rule
+       rose failover advanced on|off"""
+    s = settings()
+    a = list(argv)
+    if a in (['-h'], ['--help']):
+        print(cmd_failover.__doc__)
+        return 0
+    if len(a) == 2 and a[0] == 'advanced' and a[1] in ('on', 'off'):
+        s['failover_advanced'] = a[1] == 'on'
+    elif len(a) == 1 and a[0] in MODES or len(a) == 2 and a[0] == 'all' and a[1] in MODES:
+        mode = a[-1]
+        s['failover'] = {t: mode for t in TOOLS}
+        if s.get('failover_advanced'):
+            s['failover_rules'] = {k: mode for k in s.get('failover_rules', {})}
+    elif len(a) == 2 and a[0] in TOOLS and a[1] in MODES:
+        s['failover'][a[0]] = a[1]
+    elif len(a) == 3 and (a[2] in MODES or a[2] == 'default'):
+        src, dst = resolve_account(a[0]), resolve_account(a[1])
+        if src == dst:
+            raise Error('pick two different accounts')
+        rules = s.setdefault('failover_rules', {})
+        if a[2] == 'default':
+            rules.pop(rule_key(src, dst), None)
+        else:
+            rules[rule_key(src, dst)] = a[2]
+            s['failover_advanced'] = True
+    elif a:
+        raise Error('usage: rose failover [all|claude|codex] ask|auto|off  ·  rose failover FROM TO ask|auto|off|default'
+                    '  ·  rose failover advanced on|off')
+    if a:
+        save_settings(s)
+    return show_failover()
 
 
 def cmd_default(a):
@@ -1925,6 +2035,9 @@ def cmd_default(a):
 
 def cmd_order(a):
     s = settings()
+    if a.start:
+        s['order_from'] = a.start
+        save_settings(s)
     specs = list(a.specs)
     if specs and specs[0] in TOOLS and ':' not in specs[0]:          # old form: rose order claude a b
         specs = [f'{specs[0]}:{n}' for n in specs[1:]]
@@ -1943,7 +2056,9 @@ def cmd_order(a):
     order = chain()
     print('Order: ' + (' → '.join(spec(x) for x in order) if order else '(not set; failover stays within a tool)'))
     if order:
-        print('Used by `rose chat`, by failover, and to skip accounts over the threshold.')
+        how = ('always from #1 (--from top)' if s.get('order_from') == 'top'
+               else 'continuing after the current account (--from next)')
+        print(f'When switching: {how}.')
     return 0
 
 
@@ -2080,7 +2195,7 @@ def menu():
                 tool = pick('Tool:', [(t, LABEL[t]) for t in TOOLS])
                 mode = tool and pick('Mode:', [(m, m) for m in MODES])
                 if mode:
-                    cmd_failover(argparse.Namespace(tool=tool, mode=mode))
+                    cmd_failover([tool, mode])
             elif choice == 'add':
                 tool = pick('Tool:', [(t, LABEL[t]) for t in TOOLS])
                 if tool:
@@ -2139,10 +2254,7 @@ def parser():
     s.add_argument('--to')
     s.add_argument('--tool', **t)
     s.set_defaults(fn=cmd_move)
-    s = sub.add_parser('failover', help='off | ask | auto when an account hits its limit')
-    s.add_argument('tool', nargs='?', **t)
-    s.add_argument('mode', nargs='?', choices=MODES)
-    s.set_defaults(fn=cmd_failover)
+    sub.add_parser('failover', help='ask/auto/off for switching accounts; per switch in advanced mode')
     s = sub.add_parser('default', help='account to use when nothing else picks one')
     s.add_argument('tool', **t)
     s.add_argument('name', nargs='?')
@@ -2150,6 +2262,8 @@ def parser():
     s.set_defaults(fn=cmd_default)
     s = sub.add_parser('order', help='account order across tools: rose order claude:personal codex:main ...')
     s.add_argument('specs', nargs='*', metavar='TOOL:NAME')
+    s.add_argument('--from', dest='start', choices=('next', 'top'),
+                   help='next: continue after the current account (default); top: always start at #1')
     s.set_defaults(fn=cmd_order)
     s = sub.add_parser('defaults', help='model/effort/permission defaults applied at launch')
     s.add_argument('tool', **t)
@@ -2213,6 +2327,8 @@ def main(argv):
             return resume_cmd(argv[1:])
         if c == 'chat':
             return cmd_chat(argv[1:])
+        if c == 'failover':
+            return cmd_failover(argv[1:])
         if c == 'statusline':
             return cmd_statusline(argv[1:])
         if c == 'hook':

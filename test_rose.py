@@ -197,7 +197,7 @@ class RoseTest(unittest.TestCase):
 
     def test_ask_mode_without_terminal_never_moves(self):
         r = self.rose('claude', '-a', 'work', env={'FAKE_LIMITED': 'work'})
-        self.assertIn('failover is off', r.stderr)
+        self.assertIn('chat saved', r.stderr)
         self.assertFalse(list((self.home('claude', 'personal') / 'projects').glob('*/*.jsonl')))
 
     def test_codex_auto_failover(self):
@@ -618,6 +618,53 @@ class RoseTest(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn('needs Python 3', r.stdout)
         self.assertIn('sudo apt install git python3', r.stdout)
+
+    def test_order_from_next_or_top(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.rose('failover', 'all', 'auto')
+        # on codex (#2), limit: --from next goes to work (#3)
+        self.rose('codex', '-a', 'main', env={'FAKE_LIMITED': 'main', 'FAKE_HANG': '1'})
+        self.assertEqual(self.calls()[-1]['account'], 'work')
+        self.assertIn('continuing after the current account', self.rose('order').stdout)
+        # --from top goes back to personal (#1)
+        self.rose('order', '--from', 'top')
+        (self.tmp / 'rose' / 'cooldowns.json').unlink()
+        self.rose('codex', '-a', 'main', env={'FAKE_LIMITED': 'main', 'FAKE_HANG': '1'})
+        self.assertEqual(self.calls()[-1]['account'], 'personal')
+        self.assertIn('always from #1', self.rose('order').stdout)
+
+    def test_advanced_per_switch_modes(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.rose('failover', 'all', 'ask')
+        out = self.rose('failover', 'personal', 'codex:main', 'auto').stdout # one switch automatic
+        self.assertIn('advanced (per switch)', out)
+        self.assertRegex(out, r'Claude · personal\s+→ Codex · main\s+auto\n')
+        self.assertRegex(out, r'Codex · main\s+→ Claude · work\s+ask\s+\(default for Codex\)')
+        r = self.rose('claude', '-a', 'personal', env={'FAKE_LIMITED': 'personal', 'FAKE_HANG': '1'})
+        self.assertIn('to Codex · main', r.stderr)                          # auto although Claude is 'ask'
+        # codex → work is ask: no terminal here, so nothing moves
+        r = self.rose('codex', '-a', 'main', env={'FAKE_LIMITED': 'main'})
+        self.assertIn('chat saved', r.stderr)
+        self.assertEqual(self.calls()[-1]['tool'], 'codex')
+
+    def test_advanced_off_skips_that_switch(self):
+        self.rose('order', 'claude:personal', 'claude:work', 'codex:main')
+        self.rose('failover', 'all', 'auto')
+        self.rose('failover', 'personal', 'work', 'off')                    # never personal → work
+        self.rose('claude', '-a', 'personal', env={'FAKE_LIMITED': 'personal', 'FAKE_HANG': '1'})
+        last = self.calls()[-1]
+        self.assertEqual((last['tool'], last['account']), ('codex', 'main'))
+        self.rose('failover', 'personal', 'work', 'default')
+        self.assertNotIn('off', self.rose('failover').stdout.split('ask  =')[0])
+
+    def test_failover_all_and_errors(self):
+        out = self.rose('failover', 'all', 'auto').stdout
+        self.assertIn('from Claude  auto', out)
+        self.assertIn('from Codex   auto', out)
+        r = self.rose('failover', 'nobody', 'work', 'auto', check=False)
+        self.assertEqual(r.returncode, 1)
+        r = self.rose('failover', 'codex', 'work', 'auto', check=False)       # codex has two accounts here
+        self.assertIn('say which', r.stderr)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
