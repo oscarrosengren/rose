@@ -31,7 +31,8 @@ import threading
 import time
 import uuid
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
+INSTALL_CMD = 'curl -fsSL https://raw.githubusercontent.com/oscarrosengren/rose/main/install.sh | sh'
 SELF = Path(__file__).resolve()
 APP = SELF.parent
 ROOT = Path(os.environ.get('ROSE_HOME') or
@@ -1724,10 +1725,32 @@ def cmd_continue(argv):
                   mode=st['mode'], chat_name=st['chat_name'], tried=st['tried'])
 
 
+class GitError(Error):
+    pass
+
+
+def friendly_git_error(raw):
+    """Plain-language explanation of a failed git step; rose always keeps the working version."""
+    t = raw.lower()
+    keep = f'rose stays on version {VERSION}, which keeps working.'
+    if any(k in t for k in ('could not resolve host', 'unable to access', 'network is unreachable', 'timed out',
+                            'connection refused', 'failed to connect', 'could not connect', 'temporary failure')):
+        return f"Couldn't reach GitHub (is the internet connected?). {keep} Try again later."
+    if any(k in t for k in ('authentication failed', 'could not read username', 'permission denied',
+                            'repository not found', 'access denied')):
+        return f"GitHub refused the download (the project may have moved or become private). {keep}"
+    if 'does not appear to be a git repository' in t or 'no such remote' in t or 'no upstream' in t:
+        return f"rose can't find where to download updates from. {keep} Reinstall with:\n  {INSTALL_CMD}"
+    if 'not possible to fast-forward' in t or 'diverg' in t or 'not possible because you have unmerged' in t:
+        return (f'This copy of rose has its own changes that are not on GitHub, so it cannot update by itself. '
+                f'{keep} (Developers: push or rebase your commits.)')
+    return f'Updating failed. {keep}\nDetails: ' + raw.strip()[-400:]
+
+
 def git(*args, check=True):
     r = subprocess.run(['git', '-C', str(APP), *args], capture_output=True, text=True)
     if check and r.returncode != 0:
-        raise Error('git ' + ' '.join(args) + ' failed: ' + (r.stderr or r.stdout).strip())
+        raise GitError(friendly_git_error((r.stderr or '') + (r.stdout or '')))
     return r.stdout.strip()
 
 
@@ -1758,24 +1781,40 @@ def background_check():
         save_update_state(checked=time.time())
         with contextlib.suppress(OSError):
             subprocess.Popen(['git', '-C', str(APP), 'fetch', '-q'], stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+                             stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, start_new_session=True)
     new = pending_commits()
     if not new:
         return
     if policy == 'auto':
-        with contextlib.suppress(Error):
+        try:
             do_update(quiet=True)
-            print(f'rose: updated ({len(new)} change(s)); running chats keep going.', file=sys.stderr)
+            print(f'rose: updated to version {installed_version()} in the background.', file=sys.stderr)
             return
-    print(f'rose: update available ({len(new)} change(s)): rose update', file=sys.stderr)
+        except Error as e:
+            if time.time() - st.get('error_shown', 0) > 24 * 3600:   # say it at most once a day
+                save_update_state(error_shown=time.time())
+                print(f"rose: couldn't update automatically. {e}", file=sys.stderr)
+            return
+    print(f'rose: a new version is available. Install it with: rose update', file=sys.stderr)
+
+
+def installed_version():
+    r = subprocess.run([sys.executable, '-I', str(SELF), '--version'], capture_output=True, text=True)
+    return r.stdout.strip().replace('rose ', '') or '?'
 
 
 def do_update(quiet=False, force=False):
     if not (APP / '.git').exists():
-        raise Error(f'{APP} is not a git checkout; reinstall from git to enable updates (see README)')
+        raise Error(f"This copy of rose wasn't installed with the installer, so it can't update itself. "
+                    f"Reinstall (your accounts and settings are kept):\n  {INSTALL_CMD}")
     dirty = [ln for ln in git('status', '--porcelain').splitlines() if not ln.startswith('??')]
-    if dirty and not force:
-        raise Error('local changes in ' + str(APP) + ' (commit them or use --force)')
+    if dirty:
+        if not force:
+            raise Error("Some of rose's own files were changed on this computer, so rose won't overwrite them. "
+                        "To save those changes aside and update anyway: rose update --force")
+        git('stash', 'push', '-q', '-m', 'rose update ' + time.strftime('%Y-%m-%d %H:%M'))
+        if not quiet:
+            print(f'Saved your changes aside (see: git -C {APP} stash list).')
     git('fetch', '-q')
     new = pending_commits()
     if not new:
@@ -1787,36 +1826,39 @@ def do_update(quiet=False, force=False):
     check = subprocess.run([sys.executable, '-I', str(SELF), '--version'], capture_output=True, text=True)
     if check.returncode != 0:
         git('reset', '--hard', '-q', previous)
-        raise Error('the new version failed to start; kept ' + previous[:7] + ':\n' + check.stderr[-800:])
+        raise Error(f'The new version did not start correctly, so rose stayed on version {VERSION}. '
+                    f'Nothing else changed. Try again later.')
     save_update_state(previous=previous, updated=time.time())
     with contextlib.suppress(Exception):   # keep the Claude hook/status line pointing at this checkout
         if is_rose_cmd((read_json(claude_settings_file(), {}).get('statusLine') or {}).get('command'), ' statusline'):
             subprocess.run([sys.executable, str(SELF), 'setup'], capture_output=True)
     if not quiet:
-        print(f'Updated rose: {check.stdout.strip()} ({len(new)} change(s)):')
+        print(f'Updated rose from {VERSION} to {check.stdout.strip().replace("rose ", "")}.')
         for line in new:
             print('  ' + line)
-        print('Your accounts, chats and settings are untouched. Running chats keep going and switch to the')
-        print('new version the next time they restart (move / failover); new commands use it right away.')
+        print('Your accounts, chats and settings are unchanged. Open chats keep running and pick up the')
+        print('new version the next time they restart.')
     return True
 
 
 def cmd_update(a):
     if a.policy:
         s = settings()
-        s['update_policy'] = a.policy
-        save_settings(s)
-        print(f'update policy: {a.policy}  (notify = tell me; auto = install in the background; off)')
+        if not (a.if_unset and s.get('update_policy')):
+            s['update_policy'] = a.policy
+            save_settings(s)
+        print(f"updates: {s.get('update_policy')}  (auto = install by themselves; notify = tell me; off)")
         return 0
     if a.rollback:
         prev = update_state().get('previous')
         if not prev:
-            raise Error('nothing to roll back to')
+            raise Error('There is no earlier version to go back to.')
         git('reset', '--hard', '-q', prev)
         s = settings()
         s['update_policy'] = 'notify'
         save_settings(s)
-        print(f'Rolled back to {prev[:7]}; update policy set to notify.')
+        print(f'Went back to the previous version ({installed_version()}). Automatic updates are paused '
+              f'(notify); turn them back on with: rose update --policy auto')
         return 0
     if a.check:
         git('fetch', '-q')
@@ -2131,6 +2173,7 @@ def parser():
     s.add_argument('--rollback', action='store_true')
     s.add_argument('--force', action='store_true', help='update even with local changes')
     s.add_argument('--policy', choices=('notify', 'auto', 'off'))
+    s.add_argument('--if-unset', action='store_true', help=argparse.SUPPRESS)
     s.set_defaults(fn=cmd_update)
     s = sub.add_parser('init', help='print shell integration')
     s.add_argument('shell', nargs='?', choices=('bash', 'zsh'), default='bash')

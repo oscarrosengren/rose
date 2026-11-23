@@ -529,21 +529,21 @@ class RoseTest(unittest.TestCase):
             [sys.executable, str(app / 'rose'), *a], env=self.env, capture_output=True, text=True, cwd=self.project)
         self.rose('order', 'claude:personal', 'claude:work')
         self.assertIn('up to date', run('update').stdout)
-        code = (upstream / 'rose').read_text().replace("VERSION = '0.2.0'", "VERSION = '0.2.1'")
+        code = (upstream / 'rose').read_text().replace("VERSION = '0.3.0'", "VERSION = '0.3.1'")
         (upstream / 'rose').write_text(code)
         g(upstream, 'commit', '-qam', 'v2')
         self.assertIn('1 update(s) available', run('update', '--check').stdout)
         out = run('update').stdout
-        self.assertIn('Updated rose: rose 0.2.1', out)
-        self.assertEqual(run('--version').stdout.strip(), 'rose 0.2.1')
+        self.assertIn('from 0.3.0 to 0.3.1', out)
+        self.assertEqual(run('--version').stdout.strip(), 'rose 0.3.1')
         self.assertIn('Claude · personal → Claude · work', run('order').stdout)   # config untouched
         (upstream / 'rose').write_text('this is not python\n')
         g(upstream, 'commit', '-qam', 'broken')
         r = run('update')
-        self.assertIn('failed to start', r.stderr)
-        self.assertEqual(run('--version').stdout.strip(), 'rose 0.2.1')           # broken update refused
-        self.assertIn('Rolled back', run('update', '--rollback').stdout)
-        self.assertEqual(run('--version').stdout.strip(), 'rose 0.2.0')
+        self.assertIn('did not start correctly', r.stderr)
+        self.assertEqual(run('--version').stdout.strip(), 'rose 0.3.1')           # broken update refused
+        self.assertIn('Went back to the previous version', run('update', '--rollback').stdout)
+        self.assertEqual(run('--version').stdout.strip(), 'rose 0.3.0')
 
     def test_running_chat_adopts_updated_code_at_next_restart(self):
         upstream, app, g = self.make_install()
@@ -553,6 +553,71 @@ class RoseTest(unittest.TestCase):
                            env=dict(self.env, FAKE_LIMITED='work', FAKE_HANG='1', FAKE_TOUCH=str(app / 'rose')))
         self.assertIn('continuing on the updated rose', r.stderr)
         self.assertEqual(self.calls()[-1]['account'], 'personal')
+
+    def run_app(self, app, *a, env=None):
+        return subprocess.run([sys.executable, str(app / 'rose'), *a], env=dict(self.env, **(env or {})),
+                              capture_output=True, text=True, cwd=self.project, stdin=subprocess.DEVNULL, timeout=60)
+
+    def test_update_errors_are_plain_language(self):
+        upstream, app, g = self.make_install()
+        subprocess.run(['git', '-C', str(app), 'remote', 'set-url', 'origin', 'https://invalid.invalid/rose.git'],
+                       check=True)
+        r = self.run_app(app, 'update')
+        self.assertIn("Couldn't reach GitHub", r.stderr)
+        self.assertIn('stays on version', r.stderr)
+        self.assertNotIn('fatal:', r.stderr)
+        subprocess.run(['git', '-C', str(app), 'remote', 'set-url', 'origin', str(upstream)], check=True)
+        (app / 'rose').write_text((app / 'rose').read_text() + '\n# my tweak\n')
+        r = self.run_app(app, 'update')
+        self.assertIn('rose update --force', r.stderr)
+        (upstream / 'rose').write_text((upstream / 'rose').read_text().replace("VERSION = '0.3.0'", "VERSION = '0.3.1'"))
+        g(upstream, 'commit', '-qam', 'v2')
+        out = self.run_app(app, 'update', '--force').stdout
+        self.assertIn('Saved your changes aside', out)
+        self.assertIn('to 0.3.1', out)
+
+    def test_auto_policy_updates_in_background(self):
+        upstream, app, g = self.make_install()
+        self.run_app(app, 'update', '--policy', 'auto')
+        (upstream / 'rose').write_text((upstream / 'rose').read_text().replace("VERSION = '0.3.0'", "VERSION = '0.3.1'"))
+        g(upstream, 'commit', '-qam', 'v2')
+        subprocess.run(['git', '-C', str(app), 'fetch', '-q'], check=True)   # as the background fetch would
+        r = self.run_app(app, 'claude', '-a', 'work')
+        self.assertIn('updated to version 0.3.1 in the background', r.stderr)
+        self.assertEqual(self.run_app(app, '--version').stdout.strip(), 'rose 0.3.1')
+
+    def test_one_line_installer_from_pipe(self):
+        upstream, _, _ = self.make_install()
+        (upstream / 'install.sh').write_text((Path(ROSE).parent / 'install.sh').read_text())
+        subprocess.run(['git', '-C', str(upstream), 'add', '-A'], check=True)
+        subprocess.run(['git', '-C', str(upstream), 'commit', '-qm', 'installer'], check=True)
+        home = self.tmp / 'newhome'
+        home.mkdir()
+        env = {k: v for k, v in self.env.items() if k != 'ROSE_HOME'}
+        env.update(HOME=str(home), SHELL='/bin/zsh', ROSE_REPO=str(upstream))
+        script = (Path(ROSE).parent / 'install.sh').read_text()
+        r = subprocess.run(['sh'], input=script, env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('Installed rose', r.stdout)
+        self.assertTrue((home / '.local/bin/rose').is_symlink())
+        self.assertIn('rose init zsh', (home / '.zshrc').read_text())
+        data = json.loads((home / '.local/share/rose/settings.json').read_text())
+        self.assertEqual(data['update_policy'], 'auto')
+        r2 = subprocess.run(['sh'], input=script, env=env, capture_output=True, text=True, timeout=120)
+        self.assertIn('Updating rose', r2.stdout)                    # re-running is safe
+        self.assertEqual((home / '.zshrc').read_text().count('rose init'), 1)
+
+    def test_installer_explains_missing_python(self):
+        bin_dir = self.tmp / 'nopython'
+        bin_dir.mkdir()
+        for tool in ('sh', 'git', 'uname', 'dirname'):
+            path = subprocess.run(['sh', '-c', f'command -v {tool}'], capture_output=True, text=True).stdout.strip()
+            (bin_dir / tool).symlink_to(path)
+        r = subprocess.run(['sh'], input=(Path(ROSE).parent / 'install.sh').read_text(), capture_output=True, text=True,
+                           env={'HOME': str(self.tmp), 'PATH': str(bin_dir)})
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('needs Python 3', r.stdout)
+        self.assertIn('sudo apt install git python3', r.stdout)
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

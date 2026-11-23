@@ -14,34 +14,41 @@ Python 3.9+, macOS/Linux, no dependencies. Tests: `python3 -I test_rose.py` (off
 
 ## Install
 
-```sh
-gh repo clone oscarrosengren/rose ~/.local/share/rose-app   # or git clone
-~/.local/share/rose-app/install.sh      # links ~/.local/bin/rose, shell integration, `rose setup`
-
-rose add claude personal --adopt ~/.claude   # reuse an existing login, or sign in fresh without --adopt
-rose add claude work                         # sign-in: pick the COMPANY Claude account
-rose add codex main --adopt ~/.codex         # Codex uses a device code automatically over SSH
-rose status
-```
-
-## Updating
+Paste this into a terminal (macOS or Linux):
 
 ```sh
-rose update            # pull, check the new version starts, switch; refuses a broken update
-rose update --check    # list what's new
-rose update --rollback # back to the version before the last update
-rose update --policy auto|notify|off   # default notify: rose tells you when an update is available
+curl -fsSL https://raw.githubusercontent.com/oscarrosengren/rose/main/install.sh | sh
 ```
 
-The code (the git checkout) is separate from your data (`~/.local/share/rose`: accounts, chats, names,
-order, usage). Updating never touches the data, so there's nothing to reinstall or reconfigure.
+The installer checks for git and Python 3.9+ and tells you how to get them if they're missing. It
+puts rose in `~/.local/share/rose-app`, adds the `rose` command, and turns on automatic updates. Running
+it again is safe. Then open a new terminal and add your accounts:
 
-**While chats are running:**
-- Open chats keep working.
-- Status line and hook calls use the new version right away.
-- A running rose session switches to the new code the next time it restarts the chat (`move` or failover),
-  carrying over its account, chat name and failover state.
-- rose checks for updates at most every 6 hours, in the background, when you start a chat.
+```sh
+rose add claude personal     # sign in with your personal Claude account (or --adopt ~/.claude to reuse it)
+rose add claude work         # sign in with your work Claude account
+rose add codex main          # sign in with ChatGPT; uses a device code automatically over SSH
+rose                         # menu
+```
+
+## Updates
+
+**Updates install by themselves.** When you start a chat, rose checks GitHub in the background (at most
+every 6 hours) and installs new versions without asking. Nothing to do, and nothing to reconfigure:
+- **Your data is separate:** accounts, chats, names, order and usage live in `~/.local/share/rose`, apart
+  from the code.
+- **Broken updates are refused:** if a new version doesn't start, rose keeps the working one.
+- **Open chats keep running,** and pick up the new version the next time they restart (`move` or failover).
+
+```sh
+rose update                    # update right now
+rose update --check            # see what's new
+rose update --rollback         # go back to the previous version (pauses automatic updates)
+rose update --policy notify    # ask instead of installing by itself; or: auto, off
+```
+
+If something goes wrong, rose explains it in plain words and keeps the version that works. For example:
+"Couldn't reach GitHub (is the internet connected?). rose stays on version 0.3.0, which keeps working."
 
 ## Daily use
 
