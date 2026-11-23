@@ -31,7 +31,9 @@ import threading
 import time
 import uuid
 
-VERSION = '0.1.0'
+VERSION = '0.2.0'
+SELF = Path(__file__).resolve()
+APP = SELF.parent
 ROOT = Path(os.environ.get('ROSE_HOME') or
             Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'rose').expanduser()
 TOOLS = ('claude', 'codex')
@@ -337,62 +339,179 @@ def cmd_statusline(_argv):
     if original:
         out = subprocess.run(original, shell=True, input=raw, capture_output=True, text=True).stdout.rstrip('\n')
     with contextlib.suppress(Exception):
+        if os.environ.get('ROSE_SESSION'):                     # launched by rose: say so
+            label = '🌹 rose · ' + os.environ['ROSE_SESSION'].split(':', 1)[1]
+            if os.environ.get('ROSE_CHAT'):
+                label += ' · ' + os.environ['ROSE_CHAT']
+            out = label + ('  │ ' + out if out else '')
         name = statusline_account()
         if name and over_threshold('claude', name):
             nxt = next_targets('claude', name)
-            out += f"  ⚠ {name} {max_used(name):.0f}%" + (f" → exit; next: {nxt[0][1]}" if nxt else '')
+            out += f"  ⚠ {name} {max_used(name):.0f}%" + (f" → type 'move' ({nxt[0][1]})" if nxt else '')
     sys.stdout.write(out)
     return 0
 
 
 def statusline_command():
-    return shlex.quote(str(Path(__file__).resolve())) + ' statusline'
+    return shlex.quote(str(SELF)) + ' statusline'
+
+
+def hook_command():
+    return shlex.quote(str(SELF)) + ' hook prompt'
+
+
+def is_rose_cmd(cmd, suffix):
+    cmd = str(cmd or '')
+    return cmd.endswith(suffix) and ('rose' in cmd)
+
+
+def claude_settings_file():
+    f = SHARED_SRC['claude'] / 'settings.json'
+    return f.resolve() if f.is_symlink() else f
+
+
+def write_claude_settings(f, data):
+    shutil.copy2(f, f.with_name(f.name + '.bak-rose'))
+    fd, tmp = tempfile.mkstemp(dir=f.parent, prefix='.rose-')
+    with os.fdopen(fd, 'w') as out:
+        out.write(json.dumps(data, indent=2, ensure_ascii=False) + '\n')
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, f)
+
+
+def integrate(install=True, quiet=False):
+    """Status line (usage + rose marker) and the 'move' prompt hook, in the shared Claude settings."""
+    s = settings()
+    f = claude_settings_file()
+    data = read_json(f, {}) if f.exists() else {}
+    before = json.dumps(data, sort_keys=True)
+    current = data.get('statusLine') or {}
+    mine = is_rose_cmd(current.get('command'), ' statusline')
+    groups = (data.get('hooks') or {}).get('UserPromptSubmit') or []
+    kept = [g for g in groups if not any(is_rose_cmd(h.get('command'), ' hook prompt') for h in g.get('hooks', []))]
+    if install:
+        if not mine:
+            s['statusline_original'] = current
+            save_settings(s)
+        data['statusLine'] = dict(current, type='command', command=statusline_command())
+        data.setdefault('hooks', {})['UserPromptSubmit'] = kept + [
+            {'hooks': [{'type': 'command', 'command': hook_command()}]}]
+    else:
+        orig = s.pop('statusline_original', None)
+        save_settings(s)
+        if mine:
+            if orig and orig.get('command'):
+                data['statusLine'] = orig
+            else:
+                data.pop('statusLine', None)
+        if kept:
+            data.setdefault('hooks', {})['UserPromptSubmit'] = kept
+        elif 'hooks' in data:
+            data['hooks'].pop('UserPromptSubmit', None)
+            if not data['hooks']:
+                del data['hooks']
+    if json.dumps(data, sort_keys=True) != before:
+        write_claude_settings(f, data)
+    if not quiet:
+        print('rose is ' + ('connected to' if install else 'disconnected from') + f' Claude Code ({f}).')
+        if install:
+            print('  status line: 🌹 marker in rose chats, usage recording, threshold warning')
+            print("  hook:        type 'move' (or 'move to work') in a rose chat to move it")
+    return 0
+
+
+def cmd_setup(a):
+    return integrate(not a.remove)
 
 
 def cmd_usage(a):
-    s = settings()
-    f = SHARED_SRC['claude'] / 'settings.json'
     if a.action in ('install', 'uninstall'):
-        data = read_json(f, None)
-        if data is None:
-            raise Error(f'cannot read {f}')
-        current = data.get('statusLine')
-        installed = bool(current and 'statusline' in str(current.get('command', '')) and
-                         str(Path(__file__).resolve()) in str(current.get('command', '')))
-        shutil.copy2(f, f.with_name(f.name + '.bak-rose-usage'))
-        if a.action == 'install':
-            if not installed:
-                s['statusline_original'] = current or {}
-                save_settings(s)
-                data['statusLine'] = dict(current or {}, type='command', command=statusline_command())
-            print('Usage recording is on. Your status line still shows the same thing.')
-        else:
-            orig = s.pop('statusline_original', None)
-            if installed:
-                if orig and orig.get('command'):
-                    data['statusLine'] = orig
-                else:
-                    data.pop('statusLine', None)
-            save_settings(s)
-            print('Usage recording is off; original status line restored.')
-        text = json.dumps(data, indent=2, ensure_ascii=False) + '\n'
-        if f.is_symlink():
-            f = f.resolve()
-        fd, tmp = tempfile.mkstemp(dir=f.parent, prefix='.rose-')
-        with os.fdopen(fd, 'w') as out:
-            out.write(text)
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, f)
-        for t, n in accounts('claude'):
-            h = account_home(t, n) / 'settings.json'
-            if h.exists() and not h.is_symlink() and h.resolve() != f.resolve():
-                print(f'  note: {t}:{n} has its own settings.json, so it does not record usage')
-        return 0
+        return integrate(a.action == 'install')
     show_usage()
-    on = 'statusline' in str((read_json(f, {}).get('statusLine') or {}).get('command', ''))
-    if not on:
-        print('Claude recording is off: rose usage install')
+    if not is_rose_cmd((read_json(claude_settings_file(), {}).get('statusLine') or {}).get('command'), ' statusline'):
+        print('Claude recording is off: rose setup')
     return 0
+
+
+# ---------------------------------------------------------------- "move" inside a chat
+
+MOVE_RE = re.compile(r'^\s*/?(?:rose\s+)?move(?:\s+(?:to\s+)?(?P<target>[A-Za-z0-9:_/.-]+))?\s*[.!]?\s*$', re.I)
+
+
+def resolve_move_target(tool, name, word=None):
+    here = (tool, name)
+    if not word:
+        options = next_targets(tool, name)
+        if not options:
+            raise Error('no other account is available (rose status)')
+        return options[0]
+    if word.lower() in TOOLS:
+        t = word.lower()
+        options = [a for a in chain() + accounts(t) if a[0] == t and a != here and has_login(*a)]
+        if not options:
+            raise Error(f'no other signed-in {LABEL[t]} account')
+        return options[0]
+    target = parse_spec(word)
+    if target == here:
+        raise Error(f'this chat is already on {spec(here)}')
+    if not has_login(*target):
+        raise Error(f'{spec(target)} is not signed in (rose login {target[0]} {target[1]})')
+    return target
+
+
+def cmd_hook(argv):
+    """Claude Code UserPromptSubmit hook: 'move [to X]' is a rose command, not a message for the model."""
+    with contextlib.suppress(Exception):
+        data = json.loads(sys.stdin.read() or '{}')
+        m = MOVE_RE.match(str(data.get('prompt', '')))
+        if not m:
+            return 0
+        launcher, session = os.environ.get('ROSE_LAUNCHER'), os.environ.get('ROSE_SESSION', '')
+        alive = False
+        if launcher:
+            with contextlib.suppress(OSError, ValueError):
+                os.kill(int(launcher), 0)
+                alive = True
+        if not alive or ':' not in session:
+            sid = str(data.get('session_id') or '')[:8] or '<chat>'
+            reason = (f"rose: this chat was not started with rose, so it can't move itself. Exit, then run "
+                      f"`rose move {sid}" + (f" --to {m.group('target')}" if m.group('target') else '') +
+                      f"` and `rose resume {sid}`.")
+        else:
+            tool, name = session.split(':', 1)
+            try:
+                target = resolve_move_target(tool, name, m.group('target'))
+                atomic_json(ROOT / 'requests' / f'{launcher}.json',
+                            {'target': list(target), 'session': data.get('session_id'), 'time': time.time()})
+                how = 'resuming there' if target[0] == tool else 'new chat there with this conversation'
+                reason = f'rose: moving this chat to {spec(target)} ({how})…'
+            except Error as e:
+                reason = f'rose: cannot move: {e}'
+        print(json.dumps({'decision': 'block', 'reason': reason}, ensure_ascii=False))
+    return 0
+
+
+def take_request(pid):
+    f = ROOT / 'requests' / f'{pid}.json'
+    req = read_json(f, None)
+    if req:
+        with contextlib.suppress(OSError):
+            f.unlink()
+        return tuple(req['target'])
+    return None
+
+
+def codex_move_request(path, since, tool, name):
+    """Codex has no prompt hook here: a last user message that is just 'move …' is the request."""
+    for item in reversed(jsonl_tail(path, 65536)):
+        p = item.get('payload') or {}
+        if item.get('type') == 'event_msg' and p.get('type') == 'user_message':
+            m = MOVE_RE.match(str(p.get('message', '')))
+            if m and iso_ts(item.get('timestamp')) >= since:
+                with contextlib.suppress(Error):
+                    return resolve_move_target(tool, name, m.group('target'))
+            return None
+    return None
 
 
 def cooldowns():
@@ -941,6 +1060,12 @@ def build_cmd(tool, args, resume=None, new_sid=None, prompt=None):
     return [b] + extra + args + tail
 
 
+def set_title(text):
+    if sys.stdout.isatty():
+        sys.stdout.write(f'\x1b]0;{text}\x07')
+        sys.stdout.flush()
+
+
 def restore_terminal():
     if sys.stdout.isatty():
         sys.stdout.write('\x1b[?1049l\x1b[?25h\x1b[0m\x1b[<u\n')
@@ -1097,12 +1222,12 @@ def codex_digest(path):
                 p = d.get('payload') or {}
                 if d.get('type') == 'event_msg' and p.get('type') in ('user_message', 'agent_message'):
                     text = str(p.get('message', '')).strip()
-                    if text and not text.startswith('<') and not text.startswith('[rose]'):
+                    if text and not text.startswith('<') and not text.startswith('[rose') and not MOVE_RE.match(text):
                         items.append(('User' if p['type'] == 'user_message' else 'Assistant', text))
     return items
 
 
-def handoff_prompt(src, path, cwd, budget=40000):
+def handoff_prompt(src, path, cwd, budget=40000, reason='limit'):
     """A new chat on another tool gets the conversation so far, newest kept when it is long."""
     items = (claude_digest if src[0] == 'claude' else codex_digest)(path)
     parts, used = [], 0
@@ -1114,10 +1239,16 @@ def handoff_prompt(src, path, cwd, budget=40000):
             break
         parts.append(f'### {role}\n{text}')
         used += len(text)
-    return (f'[rose handoff] This task was started in {LABEL[src[0]]} (account {src[1]}), which hit its '
-            f'usage limit. Below is that conversation so far, oldest first. Continue the task from where it '
-            f'stopped. The working directory is {cwd}; inspect it to see what was already done, and do not '
-            f'repeat anything that has side effects.\n\n' + '\n\n'.join(reversed(parts)))
+    if reason == 'moved':
+        head = (f'[rose handoff] The user moved this conversation here from {LABEL[src[0]]} (account {src[1]}). '
+                f'Below is that conversation so far, oldest first. Do not start new work: briefly confirm you '
+                f'have the context and wait for the next instruction. The working directory is {cwd}.')
+    else:
+        head = (f'[rose handoff] This task was started in {LABEL[src[0]]} (account {src[1]}), which hit its '
+                f'usage limit. Below is that conversation so far, oldest first. Continue the task from where it '
+                f'stopped. The working directory is {cwd}; inspect it to see what was already done, and do not '
+                f'repeat anything that has side effects.')
+    return head + '\n\n' + '\n\n'.join(reversed(parts))
 
 
 def choose_account(tool, explicit=None):
@@ -1140,17 +1271,22 @@ def choose_account(tool, explicit=None):
     return choice
 
 
-def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat_name=None):
-    """Run the native TUI under an account; on a usage limit continue on the next account in your
-    order: same tool = move the chat and resume it; other tool = new chat with a handoff of the context."""
+def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat_name=None, tried=None):
+    """Run the native TUI under an account. Afterwards: a 'move' request or a usage limit continues the
+    chat on another account (same tool: move + resume; other tool: new chat with the context handed over)."""
     if chat_name and not CHAT_NAME.match(chat_name):
         raise Error('chat names: letters, digits, . - _ (no spaces), e.g. excel-calcs')
     if chat_name and any(v.lower() == chat_name.lower() for v in chat_names().values()):
         raise Error(f"'{chat_name}' is already used by another chat")
     cwd = str(Path(cwd or os.getcwd()).resolve())
     override = mode
-    tried = {(tool, name)}
+    tried = {tuple(x) for x in (tried or [])} | {(tool, name)}
+    first = True
     while True:
+        if not first and code_changed():   # rose was updated while this chat ran: continue on the new code
+            adopt_new_code(dict(tool=tool, name=name, args=args, cwd=cwd, resume=resume, prompt=prompt,
+                                mode=override, chat_name=chat_name, tried=sorted(tried)))
+        first = False
         mode = failover_mode(tool, override)
         if mode == 'ask' and not sys.stdin.isatty():
             mode = 'off'  # nobody to ask: never move a chat silently
@@ -1161,29 +1297,51 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
         if chat_name and new_sid:
             set_chat_name(tool, new_sid, chat_name)
         cmd = build_cmd(tool, args, resume, new_sid, prompt)
-        print(f'rose: {LABEL[tool]} · {name}' + (f' · resuming {resume[:8]}' if resume else '') +
-              f' · failover {mode}', file=sys.stderr)
+        shown = chat_name or (chat_names().get(f'{tool}:{resume}') if resume else None)
+        print(f'🌹 rose · {LABEL[tool]} · {name}' + (f' · {shown}' if shown else '') +
+              (f' · resuming {resume[:8]}' if resume else '') +
+              f" · failover {mode} · type 'move' to switch account", file=sys.stderr)
+        set_title(f'🌹 rose · {LABEL[tool]} · {name}' + (f' · {shown}' if shown else ''))
         start = time.time()
         killed = threading.Event()
         done = threading.Event()
+        request = {}
+        env = environment(tool, name)
+        env.update(ROSE_LAUNCHER=str(os.getpid()), ROSE_SESSION=f'{tool}:{name}', ROSE_VERSION=VERSION)
+        if shown:
+            env['ROSE_CHAT'] = shown
+        take_request(os.getpid())  # drop a stale request
         try:
-            proc = subprocess.Popen(cmd, env=environment(tool, name), cwd=cwd)
+            proc = subprocess.Popen(cmd, env=env, cwd=cwd)
         except FileNotFoundError:
             raise Error(f'{BINARY[tool]} not found on PATH')
         register(proc.pid, tool=tool, account=name, sid=resume or new_sid, cwd=cwd, started=start)
         record('opened', tool=tool, account=name, session=resume or new_sid, cwd=cwd)
 
-        def watch(tool=tool, name=name, start=start, sid=resume or new_sid, proc=proc):
-            while not done.wait(2):
-                path = current_transcript(tool, name, cwd, start, sid)
-                if path and (claude_limit if tool == 'claude' else codex_limit)(path, start):
-                    time.sleep(1.5)  # let the tool finish writing the error
-                    killed.set()
-                    with contextlib.suppress(OSError):
-                        proc.terminate()
-                    return
-        if mode == 'auto':
-            threading.Thread(target=watch, daemon=True).start()
+        def stop(proc=proc):
+            time.sleep(0.5)
+            killed.set()
+            with contextlib.suppress(OSError):
+                proc.terminate()
+
+        def watch(tool=tool, name=name, start=start, sid=resume or new_sid, mode=mode):
+            ticks = 0
+            while not done.wait(0.5):
+                ticks += 1
+                target = take_request(os.getpid())
+                path = None
+                if not target and tool == 'codex' and ticks % 2 == 0:
+                    path = current_transcript(tool, name, cwd, start, sid)
+                    target = path and codex_move_request(path, start, tool, name)
+                if target:
+                    request['target'] = target
+                    return stop()
+                if mode == 'auto' and ticks % 4 == 0:
+                    path = path or current_transcript(tool, name, cwd, start, sid)
+                    if path and (claude_limit if tool == 'claude' else codex_limit)(path, start):
+                        time.sleep(1)  # let the tool finish writing the error
+                        return stop()
+        threading.Thread(target=watch, daemon=True).start()
         old = signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C belongs to the TUI
         try:
             rc = proc.wait()
@@ -1191,6 +1349,7 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
             done.set()
             signal.signal(signal.SIGINT, old)
             unregister(proc.pid)
+        request.setdefault('target', take_request(os.getpid()))
         if killed.is_set():
             restore_terminal()
             rc = 0  # we closed it on purpose
@@ -1207,39 +1366,48 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
                     with contextlib.suppress(Error):
                         set_chat_name(tool, sid, chat_name)
         label = chat_names().get(f'{tool}:{sid}') or (sid or '')[:8]
-        info = path and (claude_limit if tool == 'claude' else codex_limit)(path, start)
-        if not info:
-            if sid:
-                print(f'rose: resume with: rose resume {label}' +
-                      ('' if label != sid[:8] else f'   (name it: rose name {label} <name>)'), file=sys.stderr)
-            if over_threshold(tool, name):
-                nxt = next_targets(tool, name)
-                print(f'rose: {name} is at {max_used(name):.0f}% (threshold {threshold(tool)}%)' +
-                      (f'; new chats will start on {spec(nxt[0])}' if nxt else ''), file=sys.stderr)
-            return rc
-        until = float(info['reset']) if info.get('reset') else time.time() + DEFAULT_COOLDOWN
-        set_cooldown(tool, name, until, info['kind'])
-        record('limit', tool=tool, account=name, session=sid, until=until, kind=info['kind'])
-        print(f"rose: {LABEL[tool]} · {name} hit its {info['kind'].replace('_', '-')} limit "
-              f"(until {clock(until)}).", file=sys.stderr)
-        if mode == 'off' or not sid:
-            print(f'rose: failover is off. Later: rose resume {label} [--to ACCOUNT]', file=sys.stderr)
-            return rc
-        options = next_targets(tool, name, tried)
-        if not options:
-            print(f'rose: no other account is available. Chat saved: rose resume {label}', file=sys.stderr)
-            return rc
-        target = options[0]
-        how = lambda a: 'moves this chat' if a[0] == tool else 'new chat with this conversation handed over'
-        if mode == 'ask':
-            if len(options) > 1:
-                target = pick('Continue on which account?', [(o, f'{spec(o)}  ({how(o)})') for o in options])
-            elif not ask(f'Continue on {spec(target)} ({how(target)})?', default=True):
-                target = None
-            if not target:
-                print(f'rose: chat saved: rose resume {label}', file=sys.stderr)
+
+        target = request.get('target')
+        if target:                                      # the user typed 'move' in the chat
+            if not sid:
+                print('rose: could not find this chat to move it', file=sys.stderr)
                 return rc
-        event = 'auto_switched' if mode == 'auto' else 'switched'
+            event, reason = 'moved_in_chat', 'moved'
+        else:
+            info = path and (claude_limit if tool == 'claude' else codex_limit)(path, start)
+            if not info:
+                if sid:
+                    print(f'rose: resume with: rose resume {label}' +
+                          ('' if label != sid[:8] else f'   (name it: rose name {label} <name>)'), file=sys.stderr)
+                if over_threshold(tool, name):
+                    nxt = next_targets(tool, name)
+                    print(f'rose: {name} is at {max_used(name):.0f}% (threshold {threshold(tool)}%)' +
+                          (f'; new chats will start on {spec(nxt[0])}' if nxt else ''), file=sys.stderr)
+                return rc
+            until = float(info['reset']) if info.get('reset') else time.time() + DEFAULT_COOLDOWN
+            set_cooldown(tool, name, until, info['kind'])
+            record('limit', tool=tool, account=name, session=sid, until=until, kind=info['kind'])
+            print(f"rose: {LABEL[tool]} · {name} hit its {info['kind'].replace('_', '-')} limit "
+                  f"(until {clock(until)}).", file=sys.stderr)
+            if mode == 'off' or not sid:
+                print(f'rose: failover is off. Later: rose resume {label} [--to ACCOUNT]', file=sys.stderr)
+                return rc
+            options = next_targets(tool, name, tried)
+            if not options:
+                print(f'rose: no other account is available. Chat saved: rose resume {label}', file=sys.stderr)
+                return rc
+            target = options[0]
+            how = lambda a: 'moves this chat' if a[0] == tool else 'new chat with this conversation handed over'
+            if mode == 'ask':
+                if len(options) > 1:
+                    target = pick('Continue on which account?', [(o, f'{spec(o)}  ({how(o)})') for o in options])
+                elif not ask(f'Continue on {spec(target)} ({how(target)})?', default=True):
+                    target = None
+                if not target:
+                    print(f'rose: chat saved: rose resume {label}', file=sys.stderr)
+                    return rc
+            event, reason = ('auto_switched' if mode == 'auto' else 'switched'), 'limit'
+
         if target[0] == tool:
             row = next((r for r in sessions(tool, name) if r['id'] == sid), None)
             if not row:
@@ -1247,9 +1415,10 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
                 return rc
             move(row, target[1], quiet=True, event=event)
             print(f'rose: moved chat {label} {name} → {target[1]}; continuing.', file=sys.stderr)
-            name, resume, prompt, args, chat_name = target[1], sid, CONTINUE_PROMPT, [], None
+            name, resume, args, chat_name = target[1], sid, [], None
+            prompt = CONTINUE_PROMPT if reason == 'limit' else None
         else:
-            prompt = handoff_prompt((tool, name), path, cwd)
+            prompt = handoff_prompt((tool, name), path, cwd, reason=reason)
             old_name = chat_names().get(f'{tool}:{sid}')
             if old_name:
                 set_chat_name(tool, sid, None)   # the name follows the conversation
@@ -1257,7 +1426,10 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
                    cwd=cwd, title=old_name)
             print(f'rose: handing chat {label} over from {spec((tool, name))} to {spec(target)}.', file=sys.stderr)
             tool, name, resume, args, chat_name = target[0], target[1], None, [], old_name
-        tried.add(target)
+        if reason == 'limit':
+            tried.add(target)
+        else:
+            tried = {target}
 
 
 def run_tool(tool, argv):
@@ -1517,6 +1689,143 @@ def cmd_threshold(a):
     v = s.get('threshold', {}).get('claude')
     print(f"Claude threshold: {str(v) + '%' if v else 'off'}")
     print('An account at or above it is skipped for new chats, resumes and failover (5-hour or weekly usage).')
+    return 0
+
+
+# ---------------------------------------------------------------- updating
+
+LOADED_STAMP = None
+
+
+def code_stamp():
+    try:
+        st = SELF.stat()
+        return (st.st_size, st.st_mtime_ns)
+    except OSError:
+        return None
+
+
+def code_changed():
+    return LOADED_STAMP is not None and code_stamp() not in (None, LOADED_STAMP)
+
+
+def adopt_new_code(state):
+    """Re-exec the updated rose between chats; the session state is handed over."""
+    ok = subprocess.run([sys.executable, '-I', str(SELF), '--version'], capture_output=True).returncode == 0
+    if not ok:
+        return  # broken update on disk: keep running the code already loaded
+    print(f'rose: continuing on the updated rose.', file=sys.stderr)
+    os.execv(sys.executable, [sys.executable, str(SELF), '__continue', json.dumps(state)])
+
+
+def cmd_continue(argv):
+    st = json.loads(argv[0])
+    return launch(st['tool'], st['name'], st['args'], cwd=st['cwd'], resume=st['resume'], prompt=st['prompt'],
+                  mode=st['mode'], chat_name=st['chat_name'], tried=st['tried'])
+
+
+def git(*args, check=True):
+    r = subprocess.run(['git', '-C', str(APP), *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise Error('git ' + ' '.join(args) + ' failed: ' + (r.stderr or r.stdout).strip())
+    return r.stdout.strip()
+
+
+def update_state():
+    return read_json(ROOT / 'update.json', {})
+
+
+def save_update_state(**kw):
+    st = update_state()
+    st.update(kw)
+    atomic_json(ROOT / 'update.json', st)
+
+
+def pending_commits():
+    if not (APP / '.git').exists():
+        return []
+    r = subprocess.run(['git', '-C', str(APP), 'log', '--oneline', 'HEAD..@{u}'], capture_output=True, text=True)
+    return r.stdout.strip().splitlines() if r.returncode == 0 else []
+
+
+def background_check():
+    """At most every 6 h: fetch in the background (never blocks); the next run reports or applies it."""
+    policy = settings().get('update_policy', 'notify')
+    if policy == 'off' or not (APP / '.git').exists():
+        return
+    st = update_state()
+    if time.time() - st.get('checked', 0) > 6 * 3600:
+        save_update_state(checked=time.time())
+        with contextlib.suppress(OSError):
+            subprocess.Popen(['git', '-C', str(APP), 'fetch', '-q'], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+    new = pending_commits()
+    if not new:
+        return
+    if policy == 'auto':
+        with contextlib.suppress(Error):
+            do_update(quiet=True)
+            print(f'rose: updated ({len(new)} change(s)); running chats keep going.', file=sys.stderr)
+            return
+    print(f'rose: update available ({len(new)} change(s)): rose update', file=sys.stderr)
+
+
+def do_update(quiet=False, force=False):
+    if not (APP / '.git').exists():
+        raise Error(f'{APP} is not a git checkout; reinstall from git to enable updates (see README)')
+    dirty = [ln for ln in git('status', '--porcelain').splitlines() if not ln.startswith('??')]
+    if dirty and not force:
+        raise Error('local changes in ' + str(APP) + ' (commit them or use --force)')
+    git('fetch', '-q')
+    new = pending_commits()
+    if not new:
+        if not quiet:
+            print(f'rose {VERSION} is up to date.')
+        return False
+    previous = git('rev-parse', 'HEAD')
+    git('merge', '--ff-only', '-q', '@{u}')
+    check = subprocess.run([sys.executable, '-I', str(SELF), '--version'], capture_output=True, text=True)
+    if check.returncode != 0:
+        git('reset', '--hard', '-q', previous)
+        raise Error('the new version failed to start; kept ' + previous[:7] + ':\n' + check.stderr[-800:])
+    save_update_state(previous=previous, updated=time.time())
+    with contextlib.suppress(Exception):   # keep the Claude hook/status line pointing at this checkout
+        if is_rose_cmd((read_json(claude_settings_file(), {}).get('statusLine') or {}).get('command'), ' statusline'):
+            subprocess.run([sys.executable, str(SELF), 'setup'], capture_output=True)
+    if not quiet:
+        print(f'Updated rose: {check.stdout.strip()} ({len(new)} change(s)):')
+        for line in new:
+            print('  ' + line)
+        print('Your accounts, chats and settings are untouched. Running chats keep going and switch to the')
+        print('new version the next time they restart (move / failover); new commands use it right away.')
+    return True
+
+
+def cmd_update(a):
+    if a.policy:
+        s = settings()
+        s['update_policy'] = a.policy
+        save_settings(s)
+        print(f'update policy: {a.policy}  (notify = tell me; auto = install in the background; off)')
+        return 0
+    if a.rollback:
+        prev = update_state().get('previous')
+        if not prev:
+            raise Error('nothing to roll back to')
+        git('reset', '--hard', '-q', prev)
+        s = settings()
+        s['update_policy'] = 'notify'
+        save_settings(s)
+        print(f'Rolled back to {prev[:7]}; update policy set to notify.')
+        return 0
+    if a.check:
+        git('fetch', '-q')
+        new = pending_commits()
+        print(f'{len(new)} update(s) available' + (':' if new else '.'))
+        for line in new:
+            print('  ' + line)
+        return 0
+    do_update(force=a.force)
     return 0
 
 
@@ -1814,6 +2123,15 @@ def parser():
     s.add_argument('tool', nargs='?', **t)
     s.add_argument('name')
     s.set_defaults(fn=cmd_pin)
+    s = sub.add_parser('setup', help="connect rose to Claude Code: 🌹 status line, usage, 'move' hook")
+    s.add_argument('--remove', action='store_true')
+    s.set_defaults(fn=cmd_setup)
+    s = sub.add_parser('update', help='update rose in place (keeps all accounts and settings)')
+    s.add_argument('--check', action='store_true')
+    s.add_argument('--rollback', action='store_true')
+    s.add_argument('--force', action='store_true', help='update even with local changes')
+    s.add_argument('--policy', choices=('notify', 'auto', 'off'))
+    s.set_defaults(fn=cmd_update)
     s = sub.add_parser('init', help='print shell integration')
     s.add_argument('shell', nargs='?', choices=('bash', 'zsh'), default='bash')
     s.set_defaults(fn=cmd_init)
@@ -1826,10 +2144,15 @@ def parser():
 
 
 def main(argv):
+    global LOADED_STAMP
+    LOADED_STAMP = code_stamp()
     try:
+        c = argv[0] if argv else ''
+        if c in TOOLS + ('chat', 'resume', ''):
+            with contextlib.suppress(Exception):
+                background_check()   # cheap: local git refs; the fetch runs detached
         if not argv:
             return menu() if sys.stdin.isatty() else parser().print_help()
-        c = argv[0]
         if c in TOOLS:
             return run_tool(c, argv[1:])
         if c == 'resume':
@@ -1838,6 +2161,10 @@ def main(argv):
             return cmd_chat(argv[1:])
         if c == 'statusline':
             return cmd_statusline(argv[1:])
+        if c == 'hook':
+            return cmd_hook(argv[1:])
+        if c == '__continue':
+            return cmd_continue(argv[1:])
         if c == '__emit':
             return emit(argv[1:])
         if c in ('use', 'off'):

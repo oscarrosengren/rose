@@ -39,6 +39,16 @@ prompt = args[-1] if args and not args[-1].startswith('-') and args[-1] != sid e
 with open(os.path.join(d, sid + '.jsonl'), 'a') as f:
     f.write(json.dumps({'type': 'user', 'cwd': cwd, 'sessionId': sid, 'timestamp': now(),
                         'message': {'role': 'user', 'content': prompt}}) + '\n')
+    if os.environ.get('FAKE_TOUCH') and name in os.environ.get('FAKE_LIMITED', '').split(','):
+        with open(os.environ['FAKE_TOUCH'], 'a') as code:
+            code.write('\n# updated\n')
+    if os.environ.get('FAKE_MOVE') and name == os.environ.get('FAKE_MOVE_FROM') and '--resume' not in args:
+        import subprocess
+        f.flush()
+        hook = subprocess.run([sys.executable, os.environ['FAKE_ROSE'], 'hook', 'prompt'], text=True, capture_output=True,
+                              input=json.dumps({'prompt': os.environ['FAKE_MOVE'], 'session_id': sid}))
+        open(os.environ['FAKE_LOG'] + '.hook', 'w').write(hook.stdout)
+        time.sleep(30)
     if name in os.environ.get('FAKE_LIMITED', '').split(','):
         f.write(json.dumps({'type': 'assistant', 'isApiErrorMessage': True, 'apiError': 'usage_limit_reached',
                             'error': 'rate_limit', 'timestamp': now(), 'cwd': cwd,
@@ -74,6 +84,9 @@ else:
         f.write(json.dumps({'type': 'session_meta', 'timestamp': now(), 'payload': {'id': sid, 'cwd': os.getcwd()}}) + '\n')
 with open(path, 'a') as f:
     f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {'type': 'user_message', 'message': 'task for ' + name}}) + '\n')
+    if os.environ.get('FAKE_MOVE') and name == os.environ.get('FAKE_MOVE_FROM') and args[:1] != ['resume']:
+        f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {'type': 'user_message', 'message': os.environ['FAKE_MOVE']}}) + '\n')
+        f.flush(); time.sleep(30)
     if name in os.environ.get('FAKE_LIMITED', '').split(','):
         f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {
             'type': 'error', 'message': "You've hit your usage limit.", 'codex_error_info': 'usage_limit_exceeded'}}) + '\n')
@@ -105,8 +118,10 @@ class RoseTest(unittest.TestCase):
         self.log = self.tmp / 'calls.jsonl'
         self.env = dict(os.environ, ROSE_HOME=str(self.tmp / 'rose'), PATH=f'{bin_dir}:{os.environ["PATH"]}',
                         ROSE_CLAUDE_SHARED=str(self.shared_claude), ROSE_CODEX_SHARED=str(self.shared_codex),
-                        FAKE_LOG=str(self.log), ANTHROPIC_API_KEY='sk-ambient', OPENAI_API_KEY='sk-openai')
-        for v in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'FAKE_LIMITED', 'FAKE_HANG'):
+                        FAKE_LOG=str(self.log), ANTHROPIC_API_KEY='sk-ambient', OPENAI_API_KEY='sk-openai',
+                        FAKE_ROSE=ROSE)
+        for v in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'FAKE_LIMITED', 'FAKE_HANG', 'ROSE_SESSION', 'ROSE_LAUNCHER',
+                  'ROSE_CHAT', 'ROSE_CLAUDE', 'ROSE_CODEX'):
             self.env.pop(v, None)
         for spec in ('claude work', 'claude personal', 'codex main', 'codex spare'):
             self.rose(*'add {} --no-login'.format(spec).split())
@@ -410,7 +425,7 @@ class RoseTest(unittest.TestCase):
         self.rose('threshold', '95')
         out = self.rose('statusline', input=self.statusline_input(96, 20), env={'ROSE_CLAUDE': 'personal'}).stdout
         self.assertIn('⚠ personal 96%', out)
-        self.assertIn('next: main', out)
+        self.assertIn("type 'move' (main)", out)
 
     def test_usage_shows_all_accounts_with_bars(self):
         self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
@@ -435,6 +450,109 @@ class RoseTest(unittest.TestCase):
         self.assertIn('no usage seen yet', out)                      # work never ran
         self.assertIn('Codex · spare', out)                          # accounts outside the order too
         self.assertIn('5h 75%', self.rose('status', '--fast').stdout)
+
+    def test_statusline_shows_rose_marker_only_in_rose_chats(self):
+        inp = self.statusline_input(10, 10)
+        out = self.rose('statusline', input=inp, env={'ROSE_SESSION': 'claude:personal', 'ROSE_CHAT': 'excel-calcs'}).stdout
+        self.assertTrue(out.startswith('🌹 rose · personal · excel-calcs'), out)
+        self.assertNotIn('rose', self.rose('statusline', input=inp).stdout)
+
+    def test_hook_ignores_normal_prompts_and_explains_outside_rose(self):
+        self.assertEqual(self.rose('hook', 'prompt', input=json.dumps({'prompt': 'move the file to src/'})).stdout, '')
+        out = json.loads(self.rose('hook', 'prompt', input=json.dumps({'prompt': 'move', 'session_id': 'abcdef123'})).stdout)
+        self.assertEqual(out['decision'], 'block')
+        self.assertIn('not started with rose', out['reason'])
+        env = {'ROSE_LAUNCHER': str(os.getpid()), 'ROSE_SESSION': 'claude:work'}
+        out = json.loads(self.rose('hook', 'prompt', input=json.dumps({'prompt': 'move to nobody'}), env=env).stdout)
+        self.assertIn('cannot move', out['reason'])
+        out = json.loads(self.rose('hook', 'prompt', input=json.dumps({'prompt': 'Move to personal'}), env=env).stdout)
+        self.assertIn('moving this chat to Claude · personal', out['reason'])
+        req = json.loads((self.tmp / 'rose' / 'requests' / f'{os.getpid()}.json').read_text())
+        self.assertEqual(req['target'], ['claude', 'personal'])
+
+    def test_typing_move_in_claude_moves_the_chat(self):
+        r = self.rose('claude', '-a', 'work', '-n', 'report',
+                      env={'FAKE_MOVE': 'move to personal', 'FAKE_MOVE_FROM': 'work'})
+        self.assertIn('🌹 rose · Claude · work · report', r.stderr)
+        self.assertIn('moving this chat to Claude · personal', Path(str(self.log) + '.hook').read_text())
+        self.assertIn('work → personal', r.stderr)
+        last = self.calls()[-1]
+        self.assertEqual((last['account'], last['args'][0]), ('personal', '--resume'))
+        self.assertEqual(len(last['args']), 2)                       # resumed without a continue prompt
+        rows = json.loads(self.rose('sessions', '--json', '--all').stdout)
+        self.assertEqual([(x['account'], x['name']) for x in rows], [('personal', 'report')])
+
+    def test_typing_move_in_codex_hands_over_to_next_in_order(self):
+        self.rose('order', 'codex:main', 'claude:work')
+        r = self.rose('codex', '-a', 'main', env={'FAKE_MOVE': 'move', 'FAKE_MOVE_FROM': 'main'})
+        self.assertIn('to Claude · work', r.stderr)
+        last = self.calls()[-1]
+        self.assertEqual((last['tool'], last['account']), ('claude', 'work'))
+        self.assertIn('moved this conversation here', last['args'][-1])
+        self.assertIn('task for main', last['args'][-1])
+        self.assertNotIn('### User\nmove', last['args'][-1])
+
+    def test_setup_adds_hook_and_keeps_other_hooks(self):
+        f = self.shared_claude / 'settings.json'
+        data = json.loads(f.read_text())
+        data['hooks'] = {'UserPromptSubmit': [{'hooks': [{'type': 'command', 'command': 'mine.sh'}]}]}
+        f.write_text(json.dumps(data))
+        self.rose('setup')
+        self.rose('setup')                                           # idempotent
+        hooks = json.loads(f.read_text())['hooks']['UserPromptSubmit']
+        cmds = [h['command'] for g in hooks for h in g['hooks']]
+        self.assertEqual(len(cmds), 2)
+        self.assertEqual(cmds[0], 'mine.sh')
+        self.assertTrue(cmds[1].endswith(' hook prompt'))
+        self.rose('setup', '--remove')
+        data = json.loads(f.read_text())
+        self.assertEqual([h['command'] for g in data['hooks']['UserPromptSubmit'] for h in g['hooks']], ['mine.sh'])
+        self.assertNotIn('statusLine', data)
+
+    def make_install(self):
+        """A git-installed rose with an 'upstream' repo, like a clone from GitHub."""
+        upstream, app = self.tmp / 'upstream', self.tmp / 'app'
+        g = lambda d, *a: subprocess.run(['git', '-C', str(d), *a], check=True, capture_output=True, text=True).stdout
+        upstream.mkdir()
+        g(upstream, 'init', '-q', '-b', 'main')
+        g(upstream, 'config', 'user.email', 't@t')
+        g(upstream, 'config', 'user.name', 't')
+        (upstream / 'rose').write_text(Path(ROSE).read_text())
+        g(upstream, 'add', '-A')
+        g(upstream, 'commit', '-qm', 'v1')
+        subprocess.run(['git', 'clone', '-q', str(upstream), str(app)], check=True)
+        return upstream, app, g
+
+    def test_update_keeps_config_and_rolls_back(self):
+        upstream, app, g = self.make_install()
+        run = lambda *a, **k: self.rose(*a, **k) if False else subprocess.run(
+            [sys.executable, str(app / 'rose'), *a], env=self.env, capture_output=True, text=True, cwd=self.project)
+        self.rose('order', 'claude:personal', 'claude:work')
+        self.assertIn('up to date', run('update').stdout)
+        code = (upstream / 'rose').read_text().replace("VERSION = '0.2.0'", "VERSION = '0.2.1'")
+        (upstream / 'rose').write_text(code)
+        g(upstream, 'commit', '-qam', 'v2')
+        self.assertIn('1 update(s) available', run('update', '--check').stdout)
+        out = run('update').stdout
+        self.assertIn('Updated rose: rose 0.2.1', out)
+        self.assertEqual(run('--version').stdout.strip(), 'rose 0.2.1')
+        self.assertIn('Claude · personal → Claude · work', run('order').stdout)   # config untouched
+        (upstream / 'rose').write_text('this is not python\n')
+        g(upstream, 'commit', '-qam', 'broken')
+        r = run('update')
+        self.assertIn('failed to start', r.stderr)
+        self.assertEqual(run('--version').stdout.strip(), 'rose 0.2.1')           # broken update refused
+        self.assertIn('Rolled back', run('update', '--rollback').stdout)
+        self.assertEqual(run('--version').stdout.strip(), 'rose 0.2.0')
+
+    def test_running_chat_adopts_updated_code_at_next_restart(self):
+        upstream, app, g = self.make_install()
+        self.rose('failover', 'claude', 'auto')
+        r = subprocess.run([sys.executable, str(app / 'rose'), 'claude', '-a', 'work'], capture_output=True, text=True,
+                           cwd=self.project, timeout=60, stdin=subprocess.DEVNULL,
+                           env=dict(self.env, FAKE_LIMITED='work', FAKE_HANG='1', FAKE_TOUCH=str(app / 'rose')))
+        self.assertIn('continuing on the updated rose', r.stderr)
+        self.assertEqual(self.calls()[-1]['account'], 'personal')
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -12,18 +12,36 @@ Built on the ideas in [codexx](https://github.com/JoRo-Code/codexx) (MIT), for b
 
 Python 3.9+, macOS/Linux, no dependencies. Tests: `python3 -I test_rose.py` (offline, uses fake CLIs).
 
-## Setup
+## Install
 
 ```sh
-ln -s "$PWD/rose" ~/.local/bin/rose
-echo 'eval "$(rose init bash)"' >> ~/.bashrc     # zsh: rose init zsh >> ~/.zshrc
+gh repo clone oscarrosengren/rose ~/.local/share/rose-app   # or git clone
+~/.local/share/rose-app/install.sh      # links ~/.local/bin/rose, shell integration, `rose setup`
 
-rose add claude work         # browser sign-in: pick the COMPANY Claude account
-rose add claude personal     # browser sign-in: pick your PERSONAL Claude account
-rose add codex main          # browser sign-in: your ChatGPT/Codex account
-#   or keep the existing ~/.codex login: rose add codex main --adopt ~/.codex
+rose add claude personal --adopt ~/.claude   # reuse an existing login, or sign in fresh without --adopt
+rose add claude work                         # sign-in: pick the COMPANY Claude account
+rose add codex main --adopt ~/.codex         # Codex uses a device code automatically over SSH
 rose status
 ```
+
+## Updating
+
+```sh
+rose update            # pull, check the new version starts, switch; refuses a broken update
+rose update --check    # list what's new
+rose update --rollback # back to the version before the last update
+rose update --policy auto|notify|off   # default notify: rose tells you when an update is available
+```
+
+The code (the git checkout) is separate from your data (`~/.local/share/rose`: accounts, chats, names,
+order, usage). Updating never touches the data, so there's nothing to reinstall or reconfigure.
+
+**While chats are running:**
+- Open chats keep working.
+- Status line and hook calls use the new version right away.
+- A running rose session switches to the new code the next time it restarts the chat (`move` or failover),
+  carrying over its account, chat name and failover state.
+- rose checks for updates at most every 6 hours, in the background, when you start a chat.
 
 ## Daily use
 
@@ -42,6 +60,18 @@ rose use codex main ; rose off
 rose pin claude work          # this repo (and below) always uses work; switches on cd
 rose default claude personal  # used when nothing else decides
 ```
+
+## Inside a chat
+
+- **You can see you're in rose.** The status line starts with `🌹 rose · personal · excel-calcs`, the
+  terminal title says the same, and rose prints a line before the chat opens.
+- **Type `move` to switch accounts.** `move` goes to the next account in your order. `move to work`,
+  `move personal` or `move codex` go to that account. Same tool: the chat is moved and reopened with its
+  full history. Other tool: a new chat opens with the conversation handed over.
+  - **Claude:** a prompt hook catches the message, so it never reaches the model.
+  - **Codex:** rose notices the message in the chat log and closes Codex within about a second. Codex
+    may start a reply first.
+  - **In a chat started without rose,** `move` explains the `rose move` command instead.
 
 ## Naming chats
 
