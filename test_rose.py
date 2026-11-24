@@ -59,7 +59,16 @@ with open(os.path.join(d, sid + '.jsonl'), 'a') as f:
         if os.environ.get('FAKE_HANG'): time.sleep(30)   # a TUI stays open after the error
     else:
         f.write(json.dumps({'type': 'assistant', 'timestamp': now(), 'cwd': cwd,
-                            'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': 'ok'}]}}) + '\n')
+                            'message': {'role': 'assistant', 'stop_reason': 'end_turn',
+                                        'content': [{'type': 'text', 'text': 'ok'}]}}) + '\n')
+        if os.environ.get('FAKE_CROSS') and name == os.environ.get('FAKE_CROSS_FROM') and '--resume' not in args:
+            f.flush()   # the reply pushed usage past the threshold; the status line records it, the TUI stays open
+            import subprocess
+            pct = float(os.environ['FAKE_CROSS'])
+            subprocess.run([sys.executable, os.environ['FAKE_ROSE'], 'statusline'], text=True, capture_output=True,
+                           input=json.dumps({'rate_limits': {'five_hour': {'used_percentage': pct, 'resets_at': int(time.time()) + 3600},
+                                                             'seven_day': {'used_percentage': 10, 'resets_at': int(time.time()) + 86400}}}))
+            time.sleep(float(os.environ.get('FAKE_CROSS_WAIT', 30)))
 '''
 
 FAKE_CODEX = r'''#!/usr/bin/env python3
@@ -405,6 +414,33 @@ class RoseTest(unittest.TestCase):
         self.set_usage('personal', 99)
         self.rose('claude')
         self.assertEqual(self.calls()[-1]['account'], 'personal')
+
+    def test_live_threshold_moves_running_chat_after_the_reply(self):
+        self.rose('order', 'claude:personal', 'claude:work', 'codex:main')
+        self.rose('threshold', '95')
+        self.assertIn('Live switching: on', self.rose('threshold', 'live', 'on').stdout)
+        self.rose('failover', 'claude', 'auto')
+        r = self.rose('claude', '-a', 'personal', 'do it', env={'FAKE_CROSS': '96', 'FAKE_CROSS_FROM': 'personal'})
+        self.assertIn('personal reached 96% (threshold 95%); moving this chat to Claude · work', r.stderr)
+        first, last = self.calls()[-2], self.calls()[-1]
+        self.assertEqual((last['account'], last['args'][0]), ('work', '--resume'))
+        self.assertEqual(last['args'][1], first['args'][first['args'].index('--session-id') + 1])
+        self.assertNotIn('Continue the task', ' '.join(last['args']))   # the reply was finished: just wait
+
+    def test_live_threshold_off_or_ask_keeps_the_chat(self):
+        self.rose('order', 'claude:personal', 'claude:work')
+        self.rose('threshold', '95')
+        self.rose('failover', 'claude', 'auto')
+        env = {'FAKE_CROSS': '96', 'FAKE_CROSS_FROM': 'personal', 'FAKE_CROSS_WAIT': '4'}
+        self.assertIn('Live switching: off', self.rose('threshold').stdout)      # off by default
+        r = self.rose('claude', '-a', 'personal', env=env)
+        self.assertNotIn('moving this chat', r.stderr)
+        self.rose('threshold', 'live', 'on')
+        self.rose('failover', 'claude', 'ask')
+        self.set_usage('personal', 10)
+        r = self.rose('claude', '-a', 'personal', env=env)
+        self.assertNotIn('moving this chat', r.stderr)
+        self.assertEqual(self.rose('threshold', 'live', 'maybe', check=False).returncode, 1)
 
     def test_rose_chat_uses_first_available(self):
         self.rose('order', 'claude:personal', 'codex:main', 'claude:work')

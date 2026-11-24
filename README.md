@@ -179,11 +179,12 @@ rose order claude:personal codex:main claude:work   # your order, across both to
 rose order --from next        # on a switch, continue after the current account (default)
 rose order --from top         # on a switch, always start again at #1
 rose threshold 95             # skip Claude accounts at/above 95% (5-hour or weekly)
+rose threshold live on        # also move a running chat once it passes 95% (after the reply finishes)
 rose failover                 # show how every switch is handled
 ```
 
-**When rose switches:** an account hits its usage limit, or you start or resume a chat on an account
-that is over the threshold. If the next account uses the same tool, the chat is moved and resumed
+**When rose switches:** an account hits its usage limit, you start or resume a chat on an account
+that is over the threshold, or (with `rose threshold live on`) a running chat passes the threshold. If the next account uses the same tool, the chat is moved and resumed
 with its full history. If it uses the other tool, a new chat starts in the same folder with the
 conversation so far handed over (newest messages kept, about 40k characters). It is told to check the
 folder before repeating anything. A chat name moves with the chat. A limited account is skipped until
@@ -254,9 +255,21 @@ personal is at 96% (threshold 95%). Start on Codex · main instead? [Y/n] n
 With `auto` you see no question: rose closes the limited chat itself as soon as the limit appears,
 and the next chat opens. Without a terminal (scripts), `ask` never switches.
 
-**Over the threshold mid-chat:** the status line shows `⚠ personal 96% → type 'move' (main)`. rose
-doesn't close a running chat for this, because you might be typing. The hard limit still switches
-right away.
+**Over the threshold mid-chat:** what happens depends on `rose threshold live`:
+
+- **`live off` (default):** the chat keeps going until the real limit. The status line shows
+  `⚠ personal 96% → type 'move' (main)`, so you can move it yourself.
+- **`live on`:** once the account passes the threshold, rose waits for Claude to **finish its reply**,
+  then moves the chat to the next account (within a few seconds). The status line shows
+  `⚠ personal 96% → moving to work after this reply`. Nothing is cut off, so there's no "continue"
+  message: the chat reopens on the new account and waits for your next message. If the next account is
+  Codex, it gets the conversation handed over and waits too.
+
+  Live switching only happens when that switch is set to `auto` and the next account is itself under the
+  threshold. With `ask`, you get the status line warning instead. It also only reacts to the account
+  *crossing* the threshold during the chat. If you deliberately start on an account that's already over
+  it (`rose claude -a personal`), rose leaves that chat alone. It works for Claude, the tool rose has a
+  threshold for. The hard limit always switches right away, whatever this setting is.
 
 With `auto`, a chat can continue on an account you might want to keep separate, for example from
 personal to work. Use `ask` or `off` for that switch in advanced mode.
@@ -330,8 +343,9 @@ python3 ~/dev/rose/rose status                                 # try a change wi
   such interface, so rose restarts the app with `--resume` instead. The history is kept, but the screen
   is redrawn.
 - **Usage is "last seen", not polled.** It's recorded while chats run, so idle accounts show their last value.
-- **No switching mid-chat at the threshold.** codexx switches before a new message is sent. rose warns in
-  the status line, and applies the threshold when you start, resume, move or fail over.
+- **Threshold switching mid-chat happens between replies, by restarting the chat.** codexx switches
+  before a new message is sent, inside the same app. rose (with `rose threshold live on`) moves the chat
+  once a reply has finished and reopens it on the next account.
 - **Handoffs between tools are a summary, not a resume.** The new tool gets the conversation text, but not
   the other tool's internal state.
 - **Claude may ask you to confirm** when a chat continues under a different account.
