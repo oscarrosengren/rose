@@ -72,6 +72,31 @@ rm ~/.local/bin/rose && rm -rf ~/.local/share/rose-app
 
 Then remove the `# rose` lines from `~/.zshrc` or `~/.bashrc`.
 
+### Fixing a broken Codex install
+
+Codex is sometimes installed as one bare `codex` file, without the helper programs that come with it.
+That copy starts, but fails in ways that look like rose problems, even though plain `codex` fails the
+same way:
+
+- `Error: this CLI has no complete local package; install a packaged Codex CLI ... --no-daemon`
+- Codex can't run any commands (and so can't install tools or reach Google Drive, Gmail, ...):
+  "the command tool failed to start: its codex-code-mode-host executable is missing"
+
+rose already starts Codex with `--no-daemon`, which avoids the first error but not the second. The fix
+is to install Codex as the full package. With Node.js installed:
+
+```sh
+ls -l "$(command -v codex)"     # a large file, not a link into node_modules? then it's the bare copy
+cp -p "$(command -v codex)" ~/codex-old.bak                  # keep a backup
+rm "$(command -v codex)"                                     # npm won't replace a file it didn't install
+npm install -g --prefix ~/.local @openai/codex               # installs to ~/.local/bin/codex
+hash -r && codex --version
+```
+
+Your Codex logins, chats and settings in `~/.codex` (and rose's Codex accounts) are not touched. To
+update Codex later, run the same `npm install` line again. Once the new version works, delete the
+backup with `rm ~/codex-old.bak`.
+
 ## Updates
 
 **Updates install by themselves.** When you start a chat, rose checks GitHub in the background (at most
