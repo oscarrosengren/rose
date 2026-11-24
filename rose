@@ -502,12 +502,34 @@ def take_request(pid):
     return None
 
 
+def codex_message(item):
+    """(role, text) for a user or assistant message in a Codex rollout. Older Codex writes
+    event_msg user_message/agent_message; newer Codex writes event_msg item_completed with a
+    UserMessage/AgentMessage item."""
+    if item.get('type') != 'event_msg':
+        return None
+    p = item.get('payload') or {}
+    kind = p.get('type')
+    if kind in ('user_message', 'agent_message'):
+        return ('user' if kind == 'user_message' else 'assistant'), str(p.get('message') or '')
+    if kind == 'item_completed':
+        it = p.get('item') or {}
+        role = {'UserMessage': 'user', 'AgentMessage': 'assistant'}.get(it.get('type'))
+        if role:
+            parts = it.get('content') or []
+            text = ''.join(str(c.get('text') or '') for c in parts
+                           if isinstance(c, dict) and str(c.get('type', '')).lower() == 'text') \
+                if isinstance(parts, list) else str(parts)
+            return role, text
+    return None
+
+
 def codex_move_request(path, since, tool, name):
     """Codex has no prompt hook here: a last user message that is just 'move …' is the request."""
     for item in reversed(jsonl_tail(path, 65536)):
-        p = item.get('payload') or {}
-        if item.get('type') == 'event_msg' and p.get('type') == 'user_message':
-            m = MOVE_RE.match(str(p.get('message', '')))
+        msg = codex_message(item)
+        if msg and msg[0] == 'user':
+            m = MOVE_RE.match(msg[1])
             if m and iso_ts(item.get('timestamp')) >= since:
                 with contextlib.suppress(Error):
                     return resolve_move_target(tool, name, m.group('target'))
@@ -760,10 +782,10 @@ def codex_session(path, name):
     meta = head[0].get('payload') or {}
     title = ''
     for item in head:
-        p = item.get('payload') or {}
-        if item.get('type') == 'event_msg' and p.get('type') == 'user_message':
-            t = p.get('message', '')
-            if isinstance(t, str) and t.strip() and not t.lstrip().startswith('<'):
+        msg = codex_message(item)
+        if msg and msg[0] == 'user':
+            t = msg[1]
+            if t.strip() and not t.lstrip().startswith('<') and not t.startswith('[rose') and not MOVE_RE.match(t):
                 title = t
                 break
     return dict(tool='codex', account=name, id=str(meta.get('id', '')), cwd=meta.get('cwd', ''),
@@ -1003,7 +1025,7 @@ def codex_limit(path, since):
             continue
         p = item.get('payload') or {}
         kind = p.get('type')
-        if kind in ('user_message', 'agent_message'):
+        if codex_message(item):
             return None
         if kind not in ('error', 'stream_error'):
             continue
@@ -1067,7 +1089,7 @@ def build_cmd(tool, args, resume=None, new_sid=None, prompt=None):
         if resume:
             return [b, '--resume', resume] + extra + args + tail
         return [b] + (['--session-id', new_sid] if new_sid else []) + extra + args + tail
-    extra = no_daemon(args) + extra
+    extra = no_daemon(args) + keep_title(args) + extra
     if resume:
         return [b, 'resume'] + extra + args + [resume] + tail
     return [b] + extra + args + tail
@@ -1078,6 +1100,13 @@ def no_daemon(args):
     package ("this CLI has no complete local package"), and a server shared by every account is not
     what rose wants anyway: each chat gets its own (as codexx does with --no-daemon)."""
     return [] if {'--no-daemon', '--remote'} & set(args) else ['--no-daemon']
+
+
+def keep_title(args):
+    """Codex draws full-screen and sets its own window title, so neither rose's banner nor its title
+    would stay visible. Codex has no place for custom text in the chat itself; turning its title off
+    leaves rose's 🌹 title on the window/tab (unless the user configured a title themselves)."""
+    return [] if any('terminal_title' in a for a in args) else ['-c', 'tui.terminal_title=[]']
 
 
 def set_title(text):
@@ -1282,11 +1311,13 @@ def codex_digest(path):
         for line in f:
             with contextlib.suppress(ValueError):
                 d = json.loads(line)
-                p = d.get('payload') or {}
-                if d.get('type') == 'event_msg' and p.get('type') in ('user_message', 'agent_message'):
-                    text = str(p.get('message', '')).strip()
-                    if text and not text.startswith('<') and not text.startswith('[rose') and not MOVE_RE.match(text):
-                        items.append(('User' if p['type'] == 'user_message' else 'Assistant', text))
+                msg = codex_message(d)
+                if msg:
+                    text = msg[1].strip()
+                    item = ('User' if msg[0] == 'user' else 'Assistant', text)
+                    if text and not text.startswith('<') and not text.startswith('[rose') and \
+                            not MOVE_RE.match(text) and (not items or items[-1] != item):
+                        items.append(item)
     return items
 
 

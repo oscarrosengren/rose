@@ -121,8 +121,10 @@ tools and permissions are unchanged. Their own subcommands (`rose claude mcp ...
 
 ## Inside a chat
 
-- **You can see you're in rose.** The status line starts with `🌹 rose · personal · excel-calcs`, the
-  terminal title says the same, and rose prints a line before the chat opens.
+- **You can see you're in rose.** In Claude Code the status line starts with
+  `🌹 rose · personal · excel-calcs`. Codex has no place for custom text inside its chat screen, so there
+  the 🌹 shows in the window or tab title (rose turns off Codex's own title so it doesn't overwrite it).
+  rose also prints a line before the chat opens.
 - **Type `move` to switch accounts.** `move` goes to the next account in your order. `move to work`,
   `move personal` or `move codex` go to that account. Same tool: the chat is moved and reopened with its
   full history. Other tool: a new chat opens with the conversation handed over.

@@ -74,8 +74,15 @@ if args[:2] == ['login', 'status']:
 if args[:1] == ['login']:
     open(os.path.join(home, 'auth.json'), 'w').write('{}'); sys.exit(0)
 now = lambda: dt.datetime.now(dt.timezone.utc).isoformat().replace('+00:00', 'Z')
+def msg(role, text):   # current Codex: item_completed; FAKE_CODEX_OLD: the older user_message/agent_message
+    if os.environ.get('FAKE_CODEX_OLD'):
+        p = {'type': role + '_message', 'message': text}
+    else:
+        p = {'type': 'item_completed', 'item': {'type': 'UserMessage' if role == 'user' else 'AgentMessage',
+             'content': [{'type': 'text' if role == 'user' else 'Text', 'text': text}]}}
+    return json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': p}) + '\n'
 if args[:1] == ['resume']:
-    sid = [a for a in args[1:] if not a.startswith('-')][0]
+    sid = [a for i, a in enumerate(args[1:], 1) if not a.startswith('-') and args[i - 1] != '-c'][0]
     path = [os.path.join(r, f) for r, _, fs in os.walk(os.path.join(home, 'sessions')) for f in fs if sid in f][0]
 else:
     sid = str(uuid.uuid4()); d = os.path.join(home, 'sessions', '2026', '11', '23'); os.makedirs(d, exist_ok=True)
@@ -83,9 +90,9 @@ else:
     with open(path, 'w') as f:
         f.write(json.dumps({'type': 'session_meta', 'timestamp': now(), 'payload': {'id': sid, 'cwd': os.getcwd()}}) + '\n')
 with open(path, 'a') as f:
-    f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {'type': 'user_message', 'message': 'task for ' + name}}) + '\n')
+    f.write(msg('user', 'task for ' + name))
     if os.environ.get('FAKE_MOVE') and name == os.environ.get('FAKE_MOVE_FROM') and args[:1] != ['resume']:
-        f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {'type': 'user_message', 'message': os.environ['FAKE_MOVE']}}) + '\n')
+        f.write(msg('user', os.environ['FAKE_MOVE']))
         f.flush(); time.sleep(30)
     if name in os.environ.get('FAKE_LIMITED', '').split(','):
         f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {
@@ -93,7 +100,7 @@ with open(path, 'a') as f:
         f.flush()
         if os.environ.get('FAKE_HANG'): time.sleep(30)
     else:
-        f.write(json.dumps({'type': 'event_msg', 'timestamp': now(), 'payload': {'type': 'agent_message', 'message': 'ok'}}) + '\n')
+        f.write(msg('assistant', 'ok'))
 '''
 
 
@@ -387,7 +394,7 @@ class RoseTest(unittest.TestCase):
         r = self.rose('claude', 'hello')
         self.assertIn('starting on Codex · main', r.stderr)
         last = self.calls()[-1]
-        self.assertEqual((last['tool'], last['account'], last['args']), ('codex', 'main', ['--no-daemon', 'hello']))
+        self.assertEqual((last['tool'], last['account'], last['args']), ('codex', 'main', ['--no-daemon', '-c', 'tui.terminal_title=[]', 'hello']))
         self.rose('claude', '-a', 'personal')                        # explicit choice still wins
         self.assertEqual(self.calls()[-1]['account'], 'personal')
 
@@ -407,7 +414,7 @@ class RoseTest(unittest.TestCase):
         self.set_usage('personal', 97)
         r = self.rose('chat', 'second task')
         self.assertIn('skipping Claude · personal (over threshold)', r.stderr)
-        self.assertEqual((self.calls()[-1]['tool'], self.calls()[-1]['args']), ('codex', ['--no-daemon', 'second task']))
+        self.assertEqual((self.calls()[-1]['tool'], self.calls()[-1]['args']), ('codex', ['--no-daemon', '-c', 'tui.terminal_title=[]', 'second task']))
 
     def test_resume_over_threshold_moves_within_claude(self):
         self.rose('order', 'claude:personal', 'claude:work')
@@ -491,6 +498,13 @@ class RoseTest(unittest.TestCase):
         self.assertIn('moved this conversation here', last['args'][-1])
         self.assertIn('task for main', last['args'][-1])
         self.assertNotIn('### User\nmove', last['args'][-1])
+
+    def test_move_in_older_codex_format(self):   # Codex before item_completed wrote user_message events
+        self.rose('order', 'codex:main', 'claude:work')
+        r = self.rose('codex', '-a', 'main', env={'FAKE_MOVE': 'move to work', 'FAKE_MOVE_FROM': 'main',
+                                                   'FAKE_CODEX_OLD': '1'})
+        self.assertIn('to Claude · work', r.stderr)
+        self.assertIn('task for main', self.calls()[-1]['args'][-1])
 
     def test_setup_adds_hook_and_keeps_other_hooks(self):
         f = self.shared_claude / 'settings.json'
@@ -668,14 +682,14 @@ class RoseTest(unittest.TestCase):
 
     def test_codex_runs_without_shared_server(self):
         self.rose('codex', '-a', 'main')
-        self.assertEqual(self.calls()[-1]['args'], ['--no-daemon'])
+        self.assertEqual(self.calls()[-1]['args'], ['--no-daemon', '-c', 'tui.terminal_title=[]'])
         sid = json.loads(self.rose('sessions', '--json').stdout)[0]['id']
         self.rose('resume', sid[:8])
         self.assertEqual(self.calls()[-1]['args'][:2], ['resume', '--no-daemon'])
         self.rose('codex', '-a', 'main', 'exec', 'hi')                   # non-interactive: untouched
         self.assertEqual(self.calls()[-1]['args'], ['exec', 'hi'])
-        self.rose('codex', '-a', 'main', '--no-daemon')                  # not doubled
-        self.assertEqual(self.calls()[-1]['args'], ['--no-daemon'])
+        self.rose('codex', '-a', 'main', '--no-daemon', '-c', 'tui.terminal_title=["spinner"]')  # not doubled
+        self.assertEqual(self.calls()[-1]['args'], ['--no-daemon', '-c', 'tui.terminal_title=["spinner"]'])
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
