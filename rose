@@ -383,8 +383,11 @@ def cmd_statusline(_argv):
             out = '🌹 ' + usage_brief() + ('  │ ' + out if out else '')
         name = statusline_account()
         if name and over_threshold('claude', name):
+            live = os.environ.get('ROSE_SESSION') and live_switch_target('claude', name)
             nxt = next_targets('claude', name)
-            out += f"  ⚠ {name} {max_used(name):.0f}%" + (f" → type 'move' ({nxt[0][1]})" if nxt else '')
+            out += f"  ⚠ {name} {max_used(name):.0f}%" + (
+                f" → moving to {live[1]} after this reply" if live else
+                f" → type 'move' ({nxt[0][1]})" if nxt else '')
     sys.stdout.write(out)
     return 0
 
@@ -1303,6 +1306,32 @@ def over_threshold(tool, name):
     return limit is not None and used is not None and used >= limit
 
 
+def live_switch_on():
+    return bool(settings().get('threshold_live'))
+
+
+def live_switch_target(tool, name, tried=(), override=None):
+    """Where a running chat goes once its account passes the threshold: the next switch, if it is
+    automatic and that account is itself under the threshold. Otherwise None (the status line warns)."""
+    if not live_switch_on() or not over_threshold(tool, name):
+        return None
+    plan = switch_targets(tool, name, tried, override)
+    if plan and plan[0][1] == 'auto' and not over_threshold(*plan[0][0]):
+        return plan[0][0]
+    return None
+
+
+def claude_turn_done(path):
+    """True when the last conversation entry is a finished Claude reply (not mid-task)."""
+    for item in reversed(jsonl_tail(path, 131072)):
+        if item.get('isSidechain') or item.get('type') not in ('user', 'assistant'):
+            continue
+        if item.get('type') == 'user':
+            return False
+        return (item.get('message') or {}).get('stop_reason') == 'end_turn' and not item.get('isApiErrorMessage')
+    return False
+
+
 def usable(tool, name):
     return has_login(tool, name) and f'{tool}:{name}' not in cooldowns() and not exhausted(name, tool)
 
@@ -1415,6 +1444,11 @@ def handoff_prompt(src, path, cwd, budget=40000, reason='limit'):
         head = (f'[rose handoff] The user moved this conversation here from {LABEL[src[0]]} (account {src[1]}). '
                 f'Below is that conversation so far, oldest first. Do not start new work: briefly confirm you '
                 f'have the context and wait for the next instruction. The working directory is {cwd}.')
+    elif reason == 'threshold':
+        head = (f'[rose handoff] This conversation was moved here from {LABEL[src[0]]} (account {src[1]}), '
+                f'which reached its usage threshold. Below is that conversation so far, oldest first. The last '
+                f'reply was finished. Do not start new work: briefly confirm you have the context and wait for '
+                f'the next instruction. The working directory is {cwd}.')
     else:
         head = (f'[rose handoff] This task was started in {LABEL[src[0]]} (account {src[1]}), which hit its '
                 f'usage limit. Below is that conversation so far, oldest first. Continue the task from where it '
@@ -1494,7 +1528,10 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
             with contextlib.suppress(OSError):
                 proc.terminate()
 
-        def watch(tool=tool, name=name, start=start, sid=resume or new_sid, tried=frozenset(tried)):
+        live_ok = tool == 'claude' and not over_threshold(tool, name)  # crossed during this chat only
+
+        def watch(tool=tool, name=name, start=start, sid=resume or new_sid, tried=frozenset(tried),
+                  live_ok=live_ok):
             ticks = 0
             while not done.wait(0.5):
                 ticks += 1
@@ -1508,6 +1545,11 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
                     return stop()
                 if ticks % 4 == 0:
                     path = path or current_transcript(tool, name, cwd, start, sid)
+                    if live_ok and path and time.time() - path.stat().st_mtime >= 2 and claude_turn_done(path):
+                        target = live_switch_target(tool, name, tried | {(tool, name)}, override)
+                        if target:                     # past the threshold, reply finished: move now
+                            request.update(target=target, why='threshold')
+                            return stop()
                     if path and (claude_limit if tool == 'claude' else codex_limit)(path, start):
                         plan = switch_targets(tool, name, tried | {(tool, name)}, override)
                         if plan and plan[0][1] == 'auto':      # the next switch is automatic: do it now
@@ -1545,7 +1587,12 @@ def launch(tool, name, args, cwd=None, resume=None, prompt=None, mode=None, chat
             if not sid:
                 print('rose: could not find this chat to move it', file=sys.stderr)
                 return rc
-            event, reason = 'moved_in_chat', 'moved'
+            if request.get('why') == 'threshold':
+                event, reason = 'threshold_switched', 'threshold'
+                print(f'rose: {name} reached {max_used(name):.0f}% (threshold {threshold(tool)}%); '
+                      f'moving this chat to {spec(target)}.', file=sys.stderr)
+            else:
+                event, reason = 'moved_in_chat', 'moved'
         else:
             info = path and (claude_limit if tool == 'claude' else codex_limit)(path, start)
             if not info:
@@ -1857,7 +1904,16 @@ def cmd_chat(argv):
 
 def cmd_threshold(a):
     s = settings()
-    if a.value:
+    vals = a.value or []
+    if vals[:1] == ['live']:
+        if vals[1:] not in (['on'], ['off']):
+            raise Error('use: rose threshold live on | off')
+        s['threshold_live'] = vals[1] == 'on'
+        save_settings(s)
+    elif len(vals) > 1:
+        raise Error('use: rose threshold 95 | off | live on | live off')
+    elif vals:
+        a.value = vals[0]
         if a.value == 'off':
             s.setdefault('threshold', {}).pop('claude', None)
         else:
@@ -1869,6 +1925,11 @@ def cmd_threshold(a):
     v = s.get('threshold', {}).get('claude')
     print(f"Claude threshold: {str(v) + '%' if v else 'off'}")
     print('An account at or above it is skipped for new chats, resumes and failover (5-hour or weekly usage).')
+    if s.get('threshold_live'):
+        print('Live switching: on. A running chat that passes it moves to the next account as soon as the')
+        print('reply has finished (only when that switch is set to auto). Turn off: rose threshold live off')
+    else:
+        print('Live switching: off. Running chats keep going until the real limit. Turn on: rose threshold live on')
     return 0
 
 
@@ -2394,8 +2455,8 @@ def parser():
     s.add_argument('--no-yolo', dest='yolo', action='store_false')
     s.add_argument('--clear', action='store_true')
     s.set_defaults(fn=cmd_defaults)
-    s = sub.add_parser('threshold', help='skip Claude accounts at/above N%% usage: rose threshold 95 | off')
-    s.add_argument('value', nargs='?')
+    s = sub.add_parser('threshold', help='skip Claude accounts at/above N%% usage: rose threshold 95 | off | live on|off')
+    s.add_argument('value', nargs='*')
     s.set_defaults(fn=cmd_threshold)
     sub.add_parser('chat', help='new chat on the first available account in your order')
     s = sub.add_parser('usage', help='usage per account; --watch: live dashboard; bar on|off: in the status line')
