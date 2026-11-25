@@ -265,6 +265,8 @@ personal to work. Use `ask` or `off` for that switch in advanced mode.
 
 ```sh
 rose usage             # every account, in your order, with bars
+rose dashboard         # the same, kept open and redrawn every 5 s (Ctrl-C to quit); -i 2 for every 2 s
+rose usage bar on      # also show every account's usage in the Claude status line (off: rose usage bar off)
 ```
 
 ```
@@ -281,6 +283,20 @@ Claude · personal      #1 in order
 Neither needs network calls or tokens. Values are as last seen, updated while chats run. Once a
 window's reset time passes, it shows "reset". Bars turn yellow and then red as usage rises (red at the
 Claude threshold). Only subscription logins report usage (API keys don't).
+
+**Dashboard:** `rose dashboard` (or `rose usage --watch`, or *Usage dashboard* in the `rose` menu)
+keeps the usage screen open in a terminal and redraws it every few seconds. Leave it running in a
+spare window or tmux pane. It shows new numbers as soon as any chat on any account reports them.
+
+**In the status line:** with `rose usage bar on`, every Claude chat's status line shows each account's
+usage next to the 🌹 marker:
+
+```
+🌹 rose · personal  │ personal ▃37% · main ▃27% · work ▁5%  │ home:misc_claude_sessions oscar
+```
+
+Each account shows the fuller of its 5-hour and weekly windows (the one that runs out first), with
+the same green/yellow/red colors. `?` means no usage has been seen for that account yet.
 
 ## Claude Code integration
 

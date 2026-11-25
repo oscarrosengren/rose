@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import io
 import json
 import os
 from pathlib import Path
@@ -265,12 +266,43 @@ def bar(pct, width=24):
     return '█' * filled + '░' * (width - filled)
 
 
+FORCE_COLOR = False
+
+
 def paint(text, pct, limit=None):
-    if not sys.stdout.isatty():
+    if not (FORCE_COLOR or sys.stdout.isatty()):
         return text
     hot = limit if limit else 90
     color = '31' if pct >= hot else '33' if pct >= min(70, hot - 10) else '32'
     return f'\x1b[{color}m{text}\x1b[0m'
+
+
+def usage_accounts():
+    order = chain()
+    return order + [a for a in accounts() if a not in order]
+
+
+LEVELS = '▁▂▃▄▅▆▇█'
+
+
+def usage_brief(color=True):
+    """One short piece per account for the status line: 'personal ▃37% · main ▁5% · work ?'.
+    Shows the fuller of the 5-hour and weekly windows, since that is the one that runs out first."""
+    limit = threshold('claude')
+    parts = []
+    for tool, name in usage_accounts():
+        known = [u for u in (window_used(w) for _, w in account_usage(tool, name)[1]) if u is not None]
+        if not account_usage(tool, name)[1]:
+            parts.append(f'{name} ?')
+            continue
+        used = max(known) if known else 0.0
+        text = f'{name} {LEVELS[min(7, int(used / 12.5))]}{used:.0f}%'
+        if color:
+            hot = limit if (tool == 'claude' and limit) else 90
+            code = '31' if used >= hot else '33' if used >= min(70, hot - 10) else '32'
+            text = f'\x1b[{code}m{text}\x1b[0m'
+        parts.append(text)
+    return ' · '.join(parts)
 
 
 def show_usage():
@@ -344,7 +376,11 @@ def cmd_statusline(_argv):
             label = '🌹 rose · ' + os.environ['ROSE_SESSION'].split(':', 1)[1]
             if os.environ.get('ROSE_CHAT'):
                 label += ' · ' + os.environ['ROSE_CHAT']
+            if settings().get('statusline_usage'):
+                label += '  │ ' + usage_brief()
             out = label + ('  │ ' + out if out else '')
+        elif settings().get('statusline_usage'):                # plain claude: usage only
+            out = '🌹 ' + usage_brief() + ('  │ ' + out if out else '')
         name = statusline_account()
         if name and over_threshold('claude', name):
             nxt = next_targets('claude', name)
@@ -428,10 +464,52 @@ def cmd_setup(a):
 def cmd_usage(a):
     if a.action in ('install', 'uninstall'):
         return integrate(a.action == 'install')
+    if a.action == 'bar':
+        s = settings()
+        if a.value in ('on', 'off'):
+            s['statusline_usage'] = a.value == 'on'
+            save_settings(s)
+        elif a.value:
+            raise Error('use: rose usage bar on | off')
+        on = s.get('statusline_usage')
+        print(f"Usage in the Claude status line: {'on' if on else 'off'}" +
+              (f'   e.g.  🌹 rose · personal │ {usage_brief(False)}' if on else '   (turn on: rose usage bar on)'))
+        return 0
+    if a.action == 'watch' or a.watch:
+        return watch_usage(a.interval)
     show_usage()
     if not is_rose_cmd((read_json(claude_settings_file(), {}).get('statusLine') or {}).get('command'), ' statusline'):
         print('Claude recording is off: rose setup')
     return 0
+
+
+def watch_usage(interval=5.0):
+    """A live dashboard: the usage screen, redrawn every few seconds until Ctrl-C."""
+    interval = max(1.0, float(interval or 5))
+    global FORCE_COLOR
+    tty = FORCE_COLOR = sys.stdout.isatty()
+    if tty:
+        sys.stdout.write('\x1b[?1049h\x1b[?25l')   # own screen, hidden cursor
+    try:
+        while True:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                show_usage()
+            frame = buf.getvalue().replace('\n', '\x1b[K\n')  # clear leftovers of longer old lines
+            sys.stdout.write(('\x1b[H' if tty else '') + f'🌹 rose dashboard · {time.strftime("%H:%M:%S")}'
+                             f' · updates every {interval:g}s · Ctrl-C to quit\x1b[K\n\n' + frame +
+                             'Usage is what the tools last reported while a chat ran ("seen").\x1b[K\n' +
+                             ('\x1b[J' if tty else ''))
+            sys.stdout.flush()
+            if not tty:
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        if tty:
+            sys.stdout.write('\x1b[?25h\x1b[?1049l')
+            sys.stdout.flush()
 
 
 # ---------------------------------------------------------------- "move" inside a chat
@@ -2220,7 +2298,7 @@ def menu():
             print(f"  {LABEL[tool]:<7} {', '.join(names) or '-'}   failover: {s['failover'].get(tool, 'ask')}")
         choice = pick('', [('claude', 'New Claude chat'), ('codex', 'New Codex chat'), ('resume', 'Resume a chat'),
                            ('move', 'Move a chat to another account'), ('status', 'Status'),
-                           ('failover', 'Change failover mode'), ('add', 'Add an account')])
+                           ('dashboard', 'Usage dashboard (live)'), ('failover', 'Change failover mode'), ('add', 'Add an account')])
         if choice is None:
             return 0
         try:
@@ -2232,6 +2310,8 @@ def menu():
                 cmd_move(argparse.Namespace(id=None, to=None, tool=None))
             elif choice == 'status':
                 cmd_status(argparse.Namespace(fast=False))
+            elif choice == 'dashboard':
+                watch_usage()
             elif choice == 'failover':
                 tool = pick('Tool:', [(t, LABEL[t]) for t in TOOLS])
                 mode = tool and pick('Mode:', [(m, m) for m in MODES])
@@ -2318,9 +2398,15 @@ def parser():
     s.add_argument('value', nargs='?')
     s.set_defaults(fn=cmd_threshold)
     sub.add_parser('chat', help='new chat on the first available account in your order')
-    s = sub.add_parser('usage', help='live Claude plan usage per account; install/uninstall recording')
-    s.add_argument('action', nargs='?', choices=('install', 'uninstall'))
+    s = sub.add_parser('usage', help='usage per account; --watch: live dashboard; bar on|off: in the status line')
+    s.add_argument('action', nargs='?', choices=('install', 'uninstall', 'watch', 'bar'))
+    s.add_argument('value', nargs='?')
+    s.add_argument('-w', '--watch', action='store_true', help='keep the screen open and updating')
+    s.add_argument('-i', '--interval', type=float, default=5, help='seconds between updates (default 5)')
     s.set_defaults(fn=cmd_usage)
+    s = sub.add_parser('dashboard', help='live usage dashboard for all accounts (same as rose usage --watch)')
+    s.add_argument('-i', '--interval', type=float, default=5)
+    s.set_defaults(fn=lambda a: watch_usage(a.interval))
     s = sub.add_parser('activity', help='opens, limits, moves')
     s.add_argument('-n', '--limit', type=int, default=30)
     s.set_defaults(fn=cmd_activity)
