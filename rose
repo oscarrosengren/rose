@@ -204,8 +204,24 @@ CODEX_WINDOWS = {300: '5h', 10080: 'week'}
 
 
 def codex_usage(name):
-    """Latest rate-limit snapshot Codex itself wrote into this account's session files (no network)."""
+    """Latest rate-limit snapshot Codex itself wrote into this account's session files (no network).
+    Cached until a session file changes, so the status line doesn't re-read Codex's logs every time."""
     files = sorted(session_files('codex', name), key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+    if not files:
+        return {}
+    st = files[0].stat()
+    key = [str(files[0]), st.st_size, st.st_mtime]
+    cache_file = ROOT / 'usage' / f'codex-{name}.json'
+    cache = read_json(cache_file, {})
+    if cache.get('key') == key:
+        return cache.get('rec') or {}
+    rec = codex_usage_scan(files)
+    with contextlib.suppress(OSError):
+        atomic_json(cache_file, {'key': key, 'rec': rec})
+    return rec
+
+
+def codex_usage_scan(files):
     for path in files:
         for item in reversed(jsonl_tail(path, 524288)):
             pl = item.get('payload') or {}
@@ -287,19 +303,24 @@ LEVELS = '▁▂▃▄▅▆▇█'
 
 def usage_brief(color=True):
     """One short piece per account for the status line: 'personal ▃37% · main ▁5% · work ?'.
-    Shows the fuller of the 5-hour and weekly windows, since that is the one that runs out first."""
+    Shows the 5-hour window. The weekly one is added only when it is nearly used up
+    ('personal ▁5% wk 96%'), because then it blocks the account whatever the 5-hour number says."""
     limit = threshold('claude')
     parts = []
     for tool, name in usage_accounts():
-        known = [u for u in (window_used(w) for _, w in account_usage(tool, name)[1]) if u is not None]
-        if not account_usage(tool, name)[1]:
+        wins = dict(account_usage(tool, name)[1])
+        if not wins:
             parts.append(f'{name} ?')
             continue
-        used = max(known) if known else 0.0
+        hot = limit if (tool == 'claude' and limit) else 90
+        used = window_used(wins.get('5h')) or 0.0
+        week = window_used(wins.get('week'))
         text = f'{name} {LEVELS[min(7, int(used / 12.5))]}{used:.0f}%'
+        if week is not None and week >= hot:
+            text += f' wk {week:.0f}%'
         if color:
-            hot = limit if (tool == 'claude' and limit) else 90
-            code = '31' if used >= hot else '33' if used >= min(70, hot - 10) else '32'
+            worst = max(used, week if week is not None and week >= hot else 0)
+            code = '31' if worst >= hot else '33' if worst >= min(70, hot - 10) else '32'
             text = f'\x1b[{code}m{text}\x1b[0m'
         parts.append(text)
     return ' · '.join(parts)

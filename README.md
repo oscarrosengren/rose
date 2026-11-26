@@ -308,8 +308,17 @@ usage next to the 🌹 marker:
 🌹 rose · personal  │ personal ▃37% · main ▃27% · work ▁5%  │ home:misc_claude_sessions oscar
 ```
 
-Each account shows the fuller of its 5-hour and weekly windows (the one that runs out first), with
-the same green/yellow/red colors. `?` means no usage has been seen for that account yet.
+Each account shows its **5-hour** usage, with the same green/yellow/red colors. The weekly number is added
+only when it's nearly used up (`personal ▁5% wk 97%`), because then the account is blocked whatever the
+5-hour number says. `?` means no usage has been seen for that account yet.
+
+**How it updates, and what it costs:** Claude Code runs the status line command when the chat changes
+(a message comes in, a tool runs), at most a few times a second. With your settings it doesn't run on a timer, so an idle chat costs nothing. Each run is
+one short Python process: about 75 ms in total, of which the usage bar is under 10 ms. It reads a
+few small files: your Claude accounts' last usage, and Codex's numbers, which are cached and only re-read
+when a Codex chat has written something new. There are no network calls and nothing runs in the
+background. The dashboard redraws every 5 s from the same files while it's open, and uses nothing once
+closed.
 
 ## Claude Code integration
 

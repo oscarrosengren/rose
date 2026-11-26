@@ -425,6 +425,10 @@ class RoseTest(unittest.TestCase):
         out = self.rose('statusline', input='{}', env={'ROSE_SESSION': 'claude:personal'}).stdout
         plain = re.sub(r'\x1b\[[0-9;]*m', '', out)
         self.assertTrue(plain.startswith('🌹 rose · personal  │ personal ▃37% · main ? · work ?'), plain)
+        self.set_usage('personal', 5, 97)                                    # 5-hour shown; week only near the limit
+        plain = re.sub(r'\x1b\[[0-9;]*m', '', self.rose('statusline', input='{}', env={'ROSE_SESSION': 'claude:personal'}).stdout)
+        self.assertIn('personal ▁5% wk 97%', plain)
+        self.set_usage('personal', 37, 12)
         self.rose('usage', 'bar', 'off')
         self.assertNotIn('▃37%', self.rose('statusline', input='{}', env={'ROSE_SESSION': 'claude:personal'}).stdout)
         self.assertEqual(self.rose('usage', 'bar', 'maybe', check=False).returncode, 1)
@@ -515,6 +519,13 @@ class RoseTest(unittest.TestCase):
         self.assertIn('no usage seen yet', out)                      # work never ran
         self.assertIn('Codex · spare', out)                          # accounts outside the order too
         self.assertIn('5h 75%', self.rose('status', '--fast').stdout)
+        self.assertTrue((self.tmp / 'rose' / 'usage' / 'codex-main.json').exists())   # cached
+        f = d / f'rollout-2026-11-23T10-00-00-{sid}.jsonl'                              # Codex writes more:
+        with open(f, 'a') as out:                                                       # the cache refreshes
+            out.write(json.dumps({'type': 'event_msg', 'timestamp': '2026-11-23T10:02:00Z', 'payload': {
+                'type': 'token_count', 'rate_limits': {
+                    'primary': {'used_percent': 80.0, 'window_minutes': 300, 'resets_at': reset}}}}) + '\n')
+        self.assertIn('5h 80%', self.rose('status', '--fast').stdout)
 
     def test_statusline_shows_rose_marker_only_in_rose_chats(self):
         inp = self.statusline_input(10, 10)
