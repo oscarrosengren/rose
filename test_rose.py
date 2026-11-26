@@ -4,6 +4,7 @@ Run: python3 -I test_rose.py
 No real login, model request or network access happens.
 """
 import json
+import re
 import os
 from pathlib import Path
 import sqlite3
@@ -414,6 +415,27 @@ class RoseTest(unittest.TestCase):
         self.set_usage('personal', 99)
         self.rose('claude')
         self.assertEqual(self.calls()[-1]['account'], 'personal')
+
+    def test_usage_bar_in_status_line(self):
+        self.rose('order', 'claude:personal', 'codex:main', 'claude:work')
+        self.set_usage('personal', 37, 12)
+        out = self.rose('statusline', input='{}', env={'ROSE_SESSION': 'claude:personal'}).stdout
+        self.assertNotIn('main', out)                                       # off by default
+        self.assertIn('Usage in the Claude status line: on', self.rose('usage', 'bar', 'on').stdout)
+        out = self.rose('statusline', input='{}', env={'ROSE_SESSION': 'claude:personal'}).stdout
+        plain = re.sub(r'\x1b\[[0-9;]*m', '', out)
+        self.assertTrue(plain.startswith('🌹 rose · personal  │ personal ▃37% · main ? · work ?'), plain)
+        self.rose('usage', 'bar', 'off')
+        self.assertNotIn('▃37%', self.rose('statusline', input='{}', env={'ROSE_SESSION': 'claude:personal'}).stdout)
+        self.assertEqual(self.rose('usage', 'bar', 'maybe', check=False).returncode, 1)
+
+    def test_dashboard_without_terminal_prints_once(self):
+        self.set_usage('personal', 50, 20)
+        for args in (('dashboard',), ('usage', '--watch')):
+            out = self.rose(*args).stdout
+            self.assertIn('rose dashboard', out)
+            self.assertIn('Claude · personal', out)
+            self.assertIn('50%', out)
 
     def test_live_threshold_moves_running_chat_after_the_reply(self):
         self.rose('order', 'claude:personal', 'claude:work', 'codex:main')
